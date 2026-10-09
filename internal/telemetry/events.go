@@ -4,9 +4,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -86,24 +88,101 @@ func sessionHash(salt, id string) string {
 	return hex.EncodeToString(m.Sum(nil))[:16]
 }
 
-// withState runs fn on the loaded state under a non-blocking lock, only when
-// recording is allowed and consent is granted, then saves. Contention drops
-// the update: recording must never block the UI.
+// lockDrops counts updates this process dropped because the state lock
+// stayed busy, under the install id that had consent at the time. The next
+// update that gets the lock adds them to the day's Dropped counter only for
+// that same consented id; anything else forgets them, so a drop never
+// outlives a decline, a reset-id or a lapse of consent.
+var lockDrops struct {
+	sync.Mutex
+	installID string
+	n         int
+}
+
+// lockForRecord takes the state lock with a short bounded wait. Contention
+// past the wait drops the update and counts it if recordable reports, on
+// an unlocked read of the state, that it would have been recorded:
+// recording must never block the UI.
+func lockForRecord(recordable func(s *State) bool) (func(), bool) {
+	unlock, err := lockStateBriefly()
+	if err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			countLockDrop(recordable)
+		}
+		return nil, false
+	}
+	return unlock, true
+}
+
+// countLockDrop counts one drop only when consent is granted now. State
+// is written atomically, so an unlocked read sees a whole state.
+func countLockDrop(recordable func(s *State) bool) {
+	s := LoadState()
+	if ok, _ := Enabled(s); !ok || !recordable(s) {
+		return
+	}
+	lockDrops.Lock()
+	defer lockDrops.Unlock()
+	if lockDrops.installID != s.InstallID {
+		lockDrops.installID, lockDrops.n = s.InstallID, 0
+	}
+	lockDrops.n++
+}
+
+// takeLockDrops returns and forgets the counted drops and their install id.
+func takeLockDrops() (string, int) {
+	lockDrops.Lock()
+	defer lockDrops.Unlock()
+	id, n := lockDrops.installID, lockDrops.n
+	lockDrops.installID, lockDrops.n = "", 0
+	return id, n
+}
+
+// flushLockDrops adds counted lock drops to the day's Dropped counter when
+// they were counted under this consented install id, and reports whether
+// state changed. Callers hold the state lock and have checked Enabled.
+func (s *State) flushLockDrops(now time.Time) bool {
+	id, n := takeLockDrops()
+	if n <= 0 || id != s.InstallID {
+		return false
+	}
+	r := s.day(dayOf(now))
+	for range n {
+		inc(&r.Dropped)
+	}
+	return true
+}
+
+// anyUpdate: every withState update is recordable once consent is granted.
+func anyUpdate(*State) bool { return true }
+
+// eventRecordable reports whether the level would record event name.
+func eventRecordable(name string) func(s *State) bool {
+	return func(s *State) bool {
+		def, ok := LookupEvent(name)
+		return ok && (def.Basic || EffectiveLevel(s) != LevelBasic)
+	}
+}
+
+// withState runs fn on the loaded state under the state lock, only when
+// recording is allowed and consent is granted, then saves.
 func withState(fn func(s *State, now time.Time) bool) {
 	if !canRecord() {
 		return
 	}
-	unlock, err := lockStateWithFlags(syscall.LOCK_EX | syscall.LOCK_NB)
-	if err != nil {
+	unlock, ok := lockForRecord(anyUpdate)
+	if !ok {
 		return
 	}
 	defer unlock()
 	s := LoadState()
 	if ok, _ := Enabled(s); !ok {
+		takeLockDrops()
 		return
 	}
 	now := nowFn()
-	if fn(s, now) {
+	dropped := s.flushLockDrops(now)
+	if fn(s, now) || dropped {
 		_ = saveStateFast(s)
 	}
 }
@@ -128,8 +207,8 @@ func recordLocked(name string, props map[string]any, at time.Time, spool func(s 
 	if !canRecord() {
 		return
 	}
-	unlock, err := lockStateWithFlags(syscall.LOCK_EX | syscall.LOCK_NB)
-	if err != nil {
+	unlock, ok := lockForRecord(eventRecordable(name))
+	if !ok {
 		return
 	}
 	defer unlock()
@@ -139,12 +218,14 @@ func recordLocked(name string, props map[string]any, at time.Time, spool func(s 
 		at = now
 	}
 	if ok, _ := Enabled(s); !ok {
+		takeLockDrops()
 		if LogMode() {
 			logWouldRecord(name, props, at)
 		}
 		return
 	}
-	if spool(s, at) {
+	dropped := s.flushLockDrops(now)
+	if spool(s, at) || dropped {
 		_ = saveStateFast(s)
 	}
 }
