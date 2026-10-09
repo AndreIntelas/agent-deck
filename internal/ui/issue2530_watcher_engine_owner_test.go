@@ -1,0 +1,89 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+)
+
+// TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine: two TUIs of one profile
+// (allow_multiple). The first owns the watcher engine. The second runs none,
+// so the webhook port is bound once and the conductor gets each event once,
+// and its panel feed stays quiet; its panel re-reads statedb. When the first
+// quits, the second takes over: it delivers, and its panel feed gets the
+// events on the channels it has listened on since Init.
+func TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine(t *testing.T) {
+	port := issue2524FreePort(t)
+	env := newIssue2524Env(t, "hook-2530", map[string]string{"bind": "127.0.0.1", "port": port}, "", "")
+
+	first := env.home
+	if first.startWatcherEngine() == nil {
+		t.Fatal("the first TUI did not start the watcher host")
+	}
+	t.Cleanup(first.StopWatcherEngine)
+	if host := first.watcherHost.Load(); !host.IsOwner() || host.Engine() == nil {
+		t.Fatal("the first TUI does not own the engine")
+	}
+
+	second := NewHome()
+	first.instancesMu.RLock()
+	instances := append([]*session.Instance(nil), first.instances...)
+	first.instancesMu.RUnlock()
+	second.instancesMu.Lock()
+	second.instances = instances
+	second.instancesMu.Unlock()
+	if second.startWatcherEngine() == nil {
+		t.Fatal("the second TUI does not listen for its watcher panel feed")
+	}
+	t.Cleanup(second.StopWatcherEngine)
+	standby := second.watcherHost.Load()
+	if standby.IsOwner() || standby.Engine() != nil {
+		t.Fatal("the second TUI started an engine while the first owns it")
+	}
+
+	before := fmt.Sprintf("issue-2530-before-%d", time.Now().UnixNano())
+	postWebhook(t, port, "alice@example.com", before)
+	wantBefore := "[webhook] alice@example.com: " + before
+	if !env.waitForPane(wantBefore, 5*time.Second) {
+		t.Fatal("the owner did not deliver the event")
+	}
+	select {
+	case evt := <-second.watcherPanelEvents:
+		t.Fatalf("the standby TUI's panel feed got %q while another TUI owns the engine", evt.Body)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The first TUI quits.
+	first.StopWatcherEngineAndDeliveries(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	for standby.Engine() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the second TUI did not take the engine over after the first quit")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	after := fmt.Sprintf("issue-2530-after-%d", time.Now().UnixNano())
+	postWebhook(t, port, "alice@example.com", after)
+	wantAfter := "[webhook] alice@example.com: " + after
+	if !env.waitForPane(wantAfter, 5*time.Second) {
+		t.Fatal("the TUI that took over did not deliver the event")
+	}
+	select {
+	case evt, ok := <-second.watcherPanelEvents:
+		if !ok || !strings.Contains(evt.Body, after) {
+			t.Fatalf("panel feed after the takeover = %q (open %v), want the new event", evt.Body, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the panel feed the second TUI listened on since Init got nothing after the takeover")
+	}
+	if n := env.paneCount(wantBefore); n != 1 {
+		t.Fatalf("event before the takeover delivered %d times, want once", n)
+	}
+	if n := env.paneCount(wantAfter); n != 1 {
+		t.Fatalf("event after the takeover delivered %d times, want once", n)
+	}
+}
