@@ -119,6 +119,16 @@ func MaybeUpload(ctx context.Context) UploadResult {
 	if err != nil {
 		return UploadResult{Reason: err.Error()}
 	}
+	// A finished open hour joins the spool before its day's rollup is built.
+	// It is emitted only after the read, so every return below saves the
+	// state that records it as emitted.
+	s.emitOpenHour(now, func(l spoolLine) error {
+		if err := appendSpool(l); err != nil {
+			return err
+		}
+		lines = append(lines, l)
+		return nil
+	})
 	lines = atLevel(trimSpool(lines, now), EffectiveLevel(s))
 	s.dropExpiredDaily(now)
 	if s.Upload.RejectedVersion != "" && s.Upload.RejectedVersion == safeVersion(processVersion) {
@@ -361,6 +371,7 @@ func PreviewBatch() ([][]byte, error) {
 		return nil, err
 	}
 	now := nowFn()
+	s.emitOpenHour(now, func(l spoolLine) error { lines = append(lines, l); return nil })
 	bodies, _ := chunk(s.pending(atLevel(trimSpool(lines, now), EffectiveLevel(s)), now))
 	// Preview never reserves a nonce. Show a pending tick only if the TUI
 	// could send it today; basic level does not suppress the daily tick.
