@@ -2560,23 +2560,33 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 		ClearHookSessionAnchor(i.ID)
 	}
 
-	// Safety net (incident 2026-07-15): codex loads subagent-sourced threads
+	// Safety net (incident 2026-07-15): codex loads non-user child threads
 	// via `resume` but refuses user-initiated turns on them — the TUI exits
 	// status 1 with "turn/start failed in TUI" on the first typed message,
-	// killing the tmux session in an error loop. This bites bindings
-	// poisoned by a subagent turn-complete hook before the gate existed (or
-	// raced past it) AND sessions legitimately living on an adopted subagent
-	// thread from an earlier mid-flight restart. `codex fork` carries the
-	// thread's full context into a fresh thread_source=user thread that
-	// accepts input; the live-process probe then rebinds the instance to the
-	// fork's new id. See codex_subagent_gate.go.
+	// killing the tmux session in an error loop. Guardian review bindings
+	// resume their verified user ancestor. Other child bindings use `codex fork`
+	// to create a thread_source=user thread that accepts input. The live-process
+	// probe then rebinds the instance to the fork's new id. See
+	// codex_subagent_gate.go.
 	if i.CodexSessionID != "" && codexSessionNeedsFork(i.CodexSessionID, codexHome) {
-		sessionLog.Warn("codex_subagent_binding_forked",
-			slog.String("instance_id", i.ID),
-			slog.String("title", i.Title),
-			slog.String("sid", i.CodexSessionID))
-		return envPrefix + fmt.Sprintf("%s%s%s%s%s fork %s",
-			command, yoloFlag, modelFlag, reasoningFlag, identityFlag, i.CodexSessionID)
+		if parentID := codexGuardianParentThreadID(i.CodexSessionID, codexHome); parentID != "" {
+			oldID := i.CodexSessionID
+			if err := i.bindCodexSessionFromHook(parentID, "guardian_parent_recovery"); err != nil {
+				return envPrefix + fmt.Sprintf("%s%s%s%s%s fork %s",
+					command, yoloFlag, modelFlag, reasoningFlag, identityFlag, oldID)
+			}
+			_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
+				InstanceID: i.ID, Tool: i.Tool, Action: "rebind",
+				Source: "guardian_parent_recovery", OldID: oldID, NewID: parentID,
+			})
+		} else {
+			sessionLog.Warn("codex_subagent_binding_forked",
+				slog.String("instance_id", i.ID),
+				slog.String("title", i.Title),
+				slog.String("sid", i.CodexSessionID))
+			return envPrefix + fmt.Sprintf("%s%s%s%s%s fork %s",
+				command, yoloFlag, modelFlag, reasoningFlag, identityFlag, i.CodexSessionID)
+		}
 	}
 
 	if i.CodexSessionID != "" {
@@ -7289,7 +7299,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 			})
 			return
 		}
-		i.bindCodexSessionFromHook(sessionID, status.Event)
+		_ = i.bindCodexSessionFromHook(sessionID, status.Event)
 	case i.Tool == "gemini":
 		if sessionID == i.GeminiSessionID {
 			return
@@ -7306,25 +7316,16 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 // bindClaudeSessionFromHook (see that function's doc comment for the
 // PERSIST-12 rationale). It performs the same bookkeeping that the
 // inlined pre-#1139 code did — debug log, in-memory mutation, tmux env
-// propagation — and then persists the new binding to SQLite so
+// propagation — after it persists the new binding to SQLite so
 // DB-direct consumers and peer agent-deck processes observe the new
 // codex_session_id immediately, instead of reloading the stale row and
 // clobbering the in-memory mutation on the next save cycle.
-func (i *Instance) bindCodexSessionFromHook(sessionID, hookEvent string) {
+func (i *Instance) bindCodexSessionFromHook(sessionID, hookEvent string) error {
 	sessionLog.Debug("codex_session_update_from_hook",
 		slog.String("old_id", i.CodexSessionID),
 		slog.String("new_id", sessionID),
 		slog.String("event", hookEvent),
 	)
-	i.CodexSessionID = sessionID
-	i.recordCodexOwnership(sessionID)
-	i.CodexDetectedAt = time.Now()
-	i.hookSessionID = sessionID
-
-	if i.tmuxSession != nil && i.tmuxSession.Exists() {
-		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID)
-	}
-
 	// Persist the rebind to SQLite. See bindClaudeSessionFromHook for the
 	// full rationale: none of the three UpdateHookStatus callers (TUI
 	// tick, web refresh, CLI status refresh) save after a hook-triggered
@@ -7334,14 +7335,41 @@ func (i *Instance) bindCodexSessionFromHook(sessionID, hookEvent string) {
 	// producing a runaway loop of fresh "rebind" decisions on every
 	// poll. WriteCodexSessionBinding rewrites only the typed schema
 	// fields via json_set, leaving every other tool_data key untouched.
-	if db := statedb.GetGlobal(); db != nil {
-		if err := db.WriteCodexSessionBinding(i.ID, sessionID, i.CodexDetectedAt); err != nil {
+	db := i.restartDB.Load()
+	if db == nil {
+		db = statedb.GetGlobal()
+	}
+	detectedAt := time.Now()
+	if db != nil {
+		err := db.WriteCodexSessionBinding(i.ID, sessionID, detectedAt)
+		// Web mutators save live instances through a short-lived Storage,
+		// which can leave restartDB closed. Retry through the saved owning
+		// path, never through an unrelated profile's global database.
+		if err != nil && db.DB().Ping() != nil && i.storageSnapshot != nil && i.storageSnapshot.dbPath != "" {
+			var retryDB *statedb.StateDB
+			retryDB, err = statedb.Open(i.storageSnapshot.dbPath)
+			if err == nil {
+				err = retryDB.WriteCodexSessionBinding(i.ID, sessionID, detectedAt)
+				_ = retryDB.Close()
+			}
+		}
+		if err != nil {
 			sessionLog.Warn("codex_session_rebind_persist_failed",
 				slog.String("instance_id", i.ID),
 				slog.String("new_id", sessionID),
 				slog.String("error", err.Error()))
+			return err
 		}
 	}
+	i.CodexSessionID = sessionID
+	i.recordCodexOwnership(sessionID)
+	i.CodexDetectedAt = detectedAt
+	i.hookSessionID = sessionID
+
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID)
+	}
+	return nil
 }
 
 // bindGeminiSessionFromHook is the Gemini counterpart of
