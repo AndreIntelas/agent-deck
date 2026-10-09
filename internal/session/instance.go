@@ -5248,7 +5248,8 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 // and gate are inlined here (rather than wrapping the whole body in a
 // SpawnAttempt helper) to preserve the structural-grep contract that
 // checks Start()'s body for the #745 IsForkAwaitingStart guard.
-func (i *Instance) Start() error {
+func (i *Instance) Start() (startErr error) {
+	defer func() { i.recordTelemetryStartError(startErr) }()
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
@@ -5621,10 +5622,14 @@ func (i *Instance) Start() error {
 // Issue #1040: same per-instance spawn lock as Start() — a concurrent
 // `launch -m "..."` racing with a poller-triggered Start() must not
 // produce two parallel tmux sessions.
-func (i *Instance) StartWithMessage(message string) error {
+func (i *Instance) StartWithMessage(message string) (startErr error) {
+	// Conductor with no explicit message: Start() records its own telemetry
+	// start error, so return before installing the defer below or a failed
+	// start would be recorded twice.
 	if message == "" && i.IsConductor {
 		return i.Start()
 	}
+	defer func() { i.recordTelemetryStartError(startErr) }()
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
