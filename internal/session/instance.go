@@ -570,7 +570,8 @@ type Instance struct {
 	// JSON structure: {"tool": "claude", "options": {...}}
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
-	tmuxSession *tmux.Session // Internal tmux session
+	tmuxSession              *tmux.Session // Internal tmux session
+	conductorRecoveryWarning string        // protected by mu; latest spawn only
 	// Database that last loaded or saved this instance. Restart bookkeeping must
 	// return to that profile instead of whichever database is process-global.
 	restartDB atomic.Pointer[statedb.StateDB]
@@ -5607,6 +5608,7 @@ func (i *Instance) Start() error {
 		go i.detectCopilotSessionAsync()
 	}
 
+	i.recoverConductorAfterSpawn()
 	return nil
 }
 
@@ -5619,6 +5621,9 @@ func (i *Instance) Start() error {
 // `launch -m "..."` racing with a poller-triggered Start() must not
 // produce two parallel tmux sessions.
 func (i *Instance) StartWithMessage(message string) error {
+	if message == "" && i.IsConductor {
+		return i.Start()
+	}
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
@@ -10116,7 +10121,7 @@ func (i *Instance) restartRecorded(env map[string]string) error {
 	return err
 }
 
-func (i *Instance) restart(env map[string]string) error {
+func (i *Instance) restart(env map[string]string) (err error) {
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
@@ -10153,6 +10158,13 @@ func (i *Instance) restart(env map[string]string) error {
 	// so it must not leave a spawn stamp that makes a concurrent caller believe
 	// a replacement is already running.
 	defer recordInstanceSpawn(i.ID)
+	// Cover every successful respawn/recreate branch while holding the spawn
+	// lock. Storm-suppressed calls and failed spawns never send recovery input.
+	defer func() {
+		if err == nil {
+			i.recoverConductorAfterSpawn()
+		}
+	}()
 	// Registered AFTER the gate and BEFORE the tmux work, so it runs on every
 	// exit of this function — including each per-tool respawn-pane fast path —
 	// while the spawn lock is still held (deferred release() was registered
