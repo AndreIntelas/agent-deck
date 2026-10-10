@@ -2012,6 +2012,9 @@ func handleSessionShow(profile string, args []string) {
 	if session.SupportsNativeFork(inst.Tool) {
 		jsonData["can_fork"] = inst.CanFork()
 	}
+	if inst.Tool == "opencode" {
+		jsonData["opencode_session_id"] = inst.OpenCodeSessionID
+	}
 	if session.IsClaudeCompatible(inst.Tool) {
 		jsonData["claude_session_id"] = inst.ClaudeSessionID
 		jsonData["can_restart"] = inst.CanRestart()

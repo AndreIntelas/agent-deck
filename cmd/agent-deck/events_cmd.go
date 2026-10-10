@@ -62,6 +62,15 @@ func openBusForRead(name string) (*events.Bus, error) {
 	}
 }
 
+// Read-only followers use the already resolved profile and never take a writer handle.
+func openFollowerBus(name string, readOnly bool) (*events.Bus, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if readOnly && (name == "" || name == "events") {
+		return events.OpenReader(events.CurrentProfile())
+	}
+	return openBusForRead(name)
+}
+
 // handleEventsFollow implements `agent-deck events follow --json [--after <cursor>]
 // [--kind <prefix>[,<prefix>]] [--session <id>] [--bus events|comms]`. It streams one canonical-JSON
 // frame per line to stdout, oldest first, and keeps streaming newly published
@@ -79,8 +88,9 @@ func handleEventsFollow(profile string, args []string) {
 	kindFlag := fs.String("kind", "", "only frames whose kind equals or starts with one of these comma-separated prefixes (e.g. session.status,session.turn,macapp.)")
 	sessionFlag := fs.String("session", "", "only frames for this session id")
 	busFlag := fs.String("bus", "events", busFlagHelp)
+	readOnlyFlag := fs.Bool("read-only", false, "observe only: no send-worker recovery, no writer handle, no demand lease (tmux.output frames appear only while another follower asks for them); fails if no writer has created the bus yet")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: agent-deck events follow --jsonl [--since <cursor>] [--kind <prefix,...>] [--session <id>] [--bus events|comms]")
+		fmt.Fprintln(os.Stderr, "Usage: agent-deck events follow --jsonl [--since <cursor>] [--kind <prefix,...>] [--session <id>] [--bus events|comms] [--read-only]")
 		fs.PrintDefaults()
 	}
 	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
@@ -99,13 +109,9 @@ func handleEventsFollow(profile string, args []string) {
 	// A client that only follows the bus still gets queued sends that a
 	// reboot left unfinished delivered: their workers restart here.
 	// Read-only: the queue directory is only looked at, never created.
-	if p, err := session.ResolveProfileForStorage(profile); err == nil {
-		if dir, err := session.GetProfileDir(p); err == nil {
-			kickPendingSendWorkers(profile, sendqueue.Dir(dir), "")
-		}
-	}
+	recoverFollowerWorkers(profile, *readOnlyFlag, kickPendingSendWorkers)
 
-	bus, err := openBusForRead(*busFlag)
+	bus, err := openFollowerBus(*busFlag, *readOnlyFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events follow: %v\n", err)
 		exitCLI(1)
@@ -136,6 +142,17 @@ func handleEventsFollow(profile string, args []string) {
 	if err := sub.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events follow: %v\n", err)
 		exitCLI(1)
+	}
+}
+
+func recoverFollowerWorkers(profile string, readOnly bool, kick func(string, string, string)) {
+	if readOnly {
+		return
+	}
+	if p, err := session.ResolveProfileForStorage(profile); err == nil {
+		if dir, err := session.GetProfileDir(p); err == nil {
+			kick(profile, sendqueue.Dir(dir), "")
+		}
 	}
 }
 
@@ -245,15 +262,16 @@ func handleEventsStats(args []string) {
 	fs := flag.NewFlagSet("agent-deck events stats", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "print stats as JSON")
 	busFlag := fs.String("bus", "events", busFlagHelp)
+	readOnlyFlag := fs.Bool("read-only", false, "read the existing event log without opening a writer; fails if no writer has created the bus yet")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: agent-deck events stats [--json] [--bus events|comms]")
+		fmt.Fprintln(os.Stderr, "Usage: agent-deck events stats [--json] [--bus events|comms] [--read-only]")
 		fs.PrintDefaults()
 	}
 	if err := parseCLIFlags(fs, args); err != nil {
 		exitCLI(1)
 	}
 
-	bus, err := openBusForRead(*busFlag)
+	bus, err := openFollowerBus(*busFlag, *readOnlyFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: events stats: %v\n", err)
 		exitCLI(1)
