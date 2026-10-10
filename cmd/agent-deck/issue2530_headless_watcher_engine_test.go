@@ -241,6 +241,24 @@ func TestIssue2530_HeadlessWebRunsTheWatcherEngine(t *testing.T) {
 	})
 }
 
+// TestIssue2530_HeadlessPicksUpTheFirstWatcherStartedLater: a `web --no-tui`
+// started before any watcher exists holds no engine lock, so the first
+// watcher created and started afterwards runs without a restart (review on
+// #2638: a process with nothing to run must not keep the lock).
+func TestIssue2530_HeadlessPicksUpTheFirstWatcherStartedLater(t *testing.T) {
+	e := newIssue2530Env(t)
+	web := e.startWeb("web")
+	if pid := e.lockPID(); pid != 0 {
+		t.Fatalf("a web process with no watcher holds the engine lock (pid %d)", pid)
+	}
+	e.createWebhookWatcher()
+	issue2530WaitFor(t, 15*time.Second, "the web process to start the engine for the new watcher", func() bool {
+		return e.lockPID() == web.Process.Pid && e.listening()
+	})
+	e.post("started-later")
+	e.waitRecorded("started-later")
+}
+
 // TestIssue2530_TwoProcessesRunOneEngineAndTheOtherTakesOver: two long-lived
 // processes on one profile. Only the first binds the webhook port; the second
 // waits. Once the owner exits, by signal or killed outright, the second takes

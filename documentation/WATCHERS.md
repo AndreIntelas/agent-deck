@@ -97,7 +97,7 @@ The usual loop:
 # Create the watcher (writes ~/.agent-deck/watcher/<name>/ with watcher.toml + state.json).
 agent-deck watcher create github --name gh-alerts --secret "$GITHUB_WEBHOOK_SECRET"
 
-# Activate it (the profile's watcher engine runs it from its next start).
+# Activate it (runs within seconds if no watcher engine runs yet, else when the engine's process restarts).
 agent-deck watcher start gh-alerts
 
 # Confirm: list shows status + events/hour; status shows recent events.
@@ -110,7 +110,7 @@ agent-deck watcher test gh-alerts
 
 `agent-deck watcher routes` prints the currently-loaded routing rules across every watcher, so you can double-check which conductor or group owns which event types.
 
-Which process runs the watchers: every long-lived agent-deck process of a profile (the TUI, `agent-deck web`, or a headless `agent-deck web --no-tui`) can run the profile's watcher engine, and exactly one does. The first to start takes the engine owner lock, `watcher-engine.lock` in the profile's runtime dir next to the daemon's `daemon.lock`, and runs every watcher marked running. The others wait on standby and retry every few seconds, so when the owner exits one of them takes over. The debug log records the outcome as `watcher_engine_owner`, `watcher_engine_standby` (with the owner's pid) or `watcher_engine_took_over`. The engine loads its watchers when it starts, so a watcher started or stopped while it runs takes effect when that process restarts.
+Which process runs the watchers: every long-lived agent-deck process of a profile (the TUI, `agent-deck web`, or a headless `agent-deck web --no-tui`) can run the profile's watcher engine, and exactly one does. The first to start with a watcher marked running takes the engine owner lock, `watcher-engine.lock` in the profile's runtime dir next to the daemon's `daemon.lock`, and runs every watcher marked running. The others wait and retry every few seconds, so when the owner exits one of them takes over, and a process with no running watcher holds no lock: the first watcher started on the profile runs within seconds. The debug log records the outcome as `watcher_engine_owner`, `watcher_engine_standby` (with the owner's pid), `watcher_engine_idle` or `watcher_engine_took_over`. A running engine loads its watchers when it starts, so a watcher started or stopped while it runs takes effect when that process restarts.
 
 Conversational setup is also supported: `agent-deck watcher install-skill watcher-creator` drops a Claude Code skill into `~/.agent-deck/skills/pool/`, and inside an agent-deck Claude session you can then ask *"Use the watcher-creator skill to set up a GitHub watcher"*. The skill walks through adapter choice, required settings, and emits the exact `watcher create` command.
 

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -75,10 +76,15 @@ type EngineHost struct {
 	owner     *EngineOwner
 	engine    *Engine
 	relayDone <-chan struct{}
-	// standbyPID and lockErr are the last waiting reason logged, so a standby
-	// host logs once per change instead of on every retry.
-	standbyPID int
-	lockErr    string
+	// waiting is the last reason logged for not owning the engine, so a
+	// waiting host logs once per change instead of on every retry.
+	// sawOwner records that another process held the lock at some point,
+	// which makes winning it later a takeover.
+	waiting  string
+	sawOwner bool
+
+	// start builds and starts the engine (startEngine; tests replace it).
+	start func(*statedb.StateDB, *slog.Logger) *Engine
 }
 
 // NewEngineHost returns a host that has not joined the election yet.
@@ -96,15 +102,16 @@ func NewEngineHost(cfg HostConfig) *EngineHost {
 		panelEvents: make(chan Event, 1),
 		panelHealth: make(chan HealthState, 1),
 		stop:        make(chan struct{}),
+		start:       startEngine,
 	}
 }
 
 // Start tries to take the engine owner lock and, if it wins, starts the
-// engine before returning. If another process owns the engine, the host
-// waits on standby and retries every RetryInterval until it wins or Stop is
-// called. Call it once.
+// engine before returning. If another process owns the engine, or there is
+// no running watcher yet, the host waits and retries every RetryInterval
+// until it runs an engine or Stop is called. Call it once.
 func (h *EngineHost) Start() {
-	if h.tryOwn(false) {
+	if h.tryOwn() {
 		return
 	}
 	h.wg.Add(1)
@@ -120,7 +127,7 @@ func (h *EngineHost) standby() {
 		case <-h.stop:
 			return
 		case <-ticker.C:
-			if h.tryOwn(true) {
+			if h.tryOwn() {
 				return
 			}
 		}
@@ -128,13 +135,34 @@ func (h *EngineHost) standby() {
 }
 
 // tryOwn takes the lock and starts the engine. It reports whether the host
-// is done waiting: it owns the engine now, or it was stopped.
-func (h *EngineHost) tryOwn(takeover bool) bool {
+// is done waiting: it runs the engine now, or it was stopped.
+//
+// A process with no running watcher does not take the lock, and one whose
+// engine did not start gives it back: holding it with nothing to run would
+// keep every other process of the profile from running a watcher started
+// later.
+func (h *EngineHost) tryOwn() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.stopped {
 		return true
 	}
+	if n, err := runningWatchers(h.cfg.DB); err != nil {
+		h.wait("load_failed:"+err.Error(), func() {
+			h.log.Warn("watcher_engine_load_failed",
+				slog.String("profile", h.cfg.Profile),
+				slog.String("error", err.Error()))
+		})
+		return false
+	} else if n == 0 {
+		h.wait("idle", func() {
+			h.log.Info("watcher_engine_idle",
+				slog.String("profile", h.cfg.Profile),
+				slog.String("reason", "no running watcher"))
+		})
+		return false
+	}
+
 	path, err := EngineLockPath(h.cfg.Profile)
 	var owner *EngineOwner
 	if err == nil {
@@ -143,42 +171,51 @@ func (h *EngineHost) tryOwn(takeover bool) bool {
 	if err != nil {
 		var running *AlreadyRunningError
 		if errors.As(err, &running) {
-			if running.PID != h.standbyPID || h.lockErr != "" {
+			h.sawOwner = true
+			h.wait("standby:"+strconv.Itoa(running.PID), func() {
 				h.log.Info("watcher_engine_standby",
 					slog.String("profile", h.cfg.Profile),
 					slog.Int("owner_pid", running.PID))
-			}
-			h.standbyPID, h.lockErr = running.PID, ""
-		} else if err.Error() != h.lockErr {
-			h.log.Warn("watcher_engine_lock_failed",
-				slog.String("profile", h.cfg.Profile),
-				slog.String("error", err.Error()))
-			h.lockErr = err.Error()
+			})
+		} else {
+			h.wait("lock_failed:"+err.Error(), func() {
+				h.log.Warn("watcher_engine_lock_failed",
+					slog.String("profile", h.cfg.Profile),
+					slog.String("error", err.Error()))
+			})
 		}
 		return false
 	}
 
-	h.owner = owner
+	eng := h.start(h.cfg.DB, h.log)
+	if eng == nil {
+		// The engine did not start, or its watchers were stopped meanwhile:
+		// give the lock back and try again on the next tick.
+		if err := owner.Close(); err != nil {
+			h.log.Warn("watcher_engine_release_failed", slog.String("error", err.Error()))
+		}
+		return false
+	}
+	h.owner, h.engine = owner, eng
 	outcome := "watcher_engine_owner"
-	if takeover {
+	if h.sawOwner {
 		outcome = "watcher_engine_took_over"
 	}
 	h.log.Info(outcome,
 		slog.String("profile", h.cfg.Profile),
 		slog.Int("pid", os.Getpid()),
 		slog.String("lock", path))
-
-	eng := startEngine(h.cfg.DB, h.log)
-	if eng == nil {
-		// Nothing to run: no relay will close the panel channels.
-		close(h.panelEvents)
-		close(h.panelHealth)
-		return true
-	}
-	h.engine = eng
 	h.relayDone = relayEngine(eng.EventCh(), eng.HealthCh(), h.cfg.DeliverEvent, h.cfg.DeliverHealth,
 		h.panelEvents, h.panelHealth, h.log)
 	return true
+}
+
+// wait logs why the host does not run the engine, once per reason.
+func (h *EngineHost) wait(reason string, log func()) {
+	if reason != h.waiting {
+		log()
+		h.waiting = reason
+	}
 }
 
 // Stop leaves the election. An owner stops its engine, waits up to 5 s for
@@ -210,7 +247,7 @@ func (h *EngineHost) Stop(drain func()) {
 			drain()
 		}
 		if owner == nil {
-			// Never owned: no relay will close the panel channels.
+			// Never ran an engine: no relay will close the panel channels.
 			close(h.panelEvents)
 			close(h.panelHealth)
 			return
@@ -229,8 +266,8 @@ func (h *EngineHost) IsOwner() bool {
 	return h.owner != nil && !h.stopped
 }
 
-// Engine returns the running engine, or nil while the host is on standby,
-// when the profile had no watchers when it took over, and after Stop.
+// Engine returns the running engine, or nil while the host waits (another
+// process owns the engine, or no watcher is running) and after Stop.
 func (h *EngineHost) Engine() *Engine {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -242,19 +279,31 @@ func (h *EngineHost) Engine() *Engine {
 
 // PanelEvents and PanelHealth carry what the relay delivered, for a TUI's
 // watcher panel. They hold at most one pending item and close when the host
-// stops (or right away if it took over with no watchers to run).
+// stops.
 func (h *EngineHost) PanelEvents() <-chan Event       { return h.panelEvents }
 func (h *EngineHost) PanelHealth() <-chan HealthState { return h.panelHealth }
 
+// runningWatchers counts the watchers marked running in db.
+func runningWatchers(db *statedb.StateDB) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
+	rows, err := db.LoadWatchers()
+	if err != nil {
+		return 0, err
+	}
+	return runningCount(rows), nil
+}
+
 // startEngine builds the watcher engine from the state database and starts
 // it: every watcher marked running gets its adapter. It returns nil when db
-// is nil or holds no watchers.
+// is nil or no watcher is running.
 func startEngine(db *statedb.StateDB, log *slog.Logger) *Engine {
 	if db == nil {
 		return nil
 	}
 	rows, err := db.LoadWatchers()
-	if err != nil || len(rows) == 0 {
+	if err != nil || runningCount(rows) == 0 {
 		return nil
 	}
 

@@ -3,6 +3,7 @@ package watcher
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -268,21 +269,79 @@ func TestEngineHost_StandbyStopsWithoutOwning(t *testing.T) {
 	}
 }
 
-// TestEngineHost_OwnerWithoutWatchersRunsNoEngine: a profile with no watchers
-// gets no engine, as before #2530, but its host still holds the lock.
-func TestEngineHost_OwnerWithoutWatchersRunsNoEngine(t *testing.T) {
-	h := NewEngineHost(HostConfig{Profile: "hostempty", DB: newTestDB(t), RetryInterval: 20 * time.Millisecond})
+// TestEngineHost_IdleWithoutARunningWatcher: a process with no running
+// watcher does not hold the lock, so it cannot keep another process of the
+// profile from running a watcher started later; once one runs, the next
+// retry starts the engine (review on #2638).
+func TestEngineHost_IdleWithoutARunningWatcher(t *testing.T) {
+	env := newHostTestEnv(t, "hostidle")
+	if err := env.db.UpdateWatcherStatus("w-hook", "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	lockPath, err := EngineLockPath(env.profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, got := env.host(t)
 	h.Start()
-	defer h.Stop(nil)
-	if !h.IsOwner() || h.Engine() != nil {
-		t.Fatalf("IsOwner=%v Engine=%v, want owner without engine", h.IsOwner(), h.Engine())
+	time.Sleep(100 * time.Millisecond) // several retries
+	if h.IsOwner() || h.Engine() != nil {
+		t.Fatal("a host with no running watcher took the engine")
 	}
-	if _, ok := <-h.PanelEvents(); ok {
-		t.Fatal("panel events not closed")
+	owner, err := AcquireEngineOwner(lockPath)
+	if err != nil {
+		t.Fatalf("lock while the only host has nothing to run: %v, want it free", err)
 	}
-	if _, ok := <-h.PanelHealth(); ok {
-		t.Fatal("panel health not closed")
+	_ = owner.Close()
+
+	if err := env.db.UpdateWatcherStatus("w-hook", "running"); err != nil {
+		t.Fatal(err)
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.Engine() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the host did not start the engine once a watcher was running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	env.post(t, "first-watcher")
+	waitDelivered(t, got, "first-watcher")
+}
+
+// TestEngineHost_GivesTheLockBackWhenNoEngineStarts: when the engine does
+// not start (its watchers were stopped after the check, or Start failed), the
+// host releases the lock it took instead of keeping it with nothing to run,
+// and starts the engine on a later retry.
+func TestEngineHost_GivesTheLockBackWhenNoEngineStarts(t *testing.T) {
+	env := newHostTestEnv(t, "hostnoengine")
+	lockPath, err := EngineLockPath(env.profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, got := env.host(t)
+	h.start = func(*statedb.StateDB, *slog.Logger) *Engine { return nil }
+	h.Start()
+	if h.IsOwner() || h.Engine() != nil {
+		t.Fatal("host reports an engine although none started")
+	}
+	owner, err := AcquireEngineOwner(lockPath)
+	if err != nil {
+		t.Fatalf("lock after a failed engine start: %v, want it released", err)
+	}
+	_ = owner.Close()
+
+	h.mu.Lock()
+	h.start = startEngine
+	h.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.Engine() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the host did not retry the engine start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	env.post(t, "after-retry")
+	waitDelivered(t, got, "after-retry")
 }
 
 // TestEngineHost_StopIsIdempotent: quit and a signal can both stop the host.

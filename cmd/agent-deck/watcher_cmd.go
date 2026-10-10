@@ -520,7 +520,7 @@ func handleWatcherStart(profile string, args []string) {
 
 	// One TUI, web or web --no-tui process per profile owns the watcher
 	// engine (#2530); the engine loads its watchers when it starts.
-	fmt.Printf("Started watcher: %s (runs from the next start of the profile's watcher engine, in its TUI or web process)\n", name)
+	fmt.Printf("Started watcher: %s (an agent-deck TUI or web process runs it: within seconds if the profile has no watcher engine yet, else once the engine's process restarts)\n", name)
 }
 
 // handleWatcherStop marks a watcher as stopped in statedb.
