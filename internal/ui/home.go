@@ -4237,10 +4237,7 @@ func (h *Home) StopWatcherEngine() {
 func (h *Home) StopWatcherEngineAndDeliveries(wait time.Duration) {
 	h.stopWatcherEngine(func() <-chan struct{} {
 		h.stopConductorDeliveries(wait)
-		if h.conductorDeliveries == nil {
-			return nil
-		}
-		return h.conductorDeliveries.finished()
+		return h.deliveryQueue().finished()
 	})
 }
 
@@ -13883,11 +13880,12 @@ func (h *Home) sendToConductor(d conductorDelivery) {
 // the wait expired mid-delivery, the one still being sent, whose outcome is
 // unknown. They stay
 // in watcher_events and the watcher's task log (durable delivery is #2537).
-// It returns the three counts.
+// It returns the three counts. The queue is created here if no delivery made
+// it yet: a relay callback still running past the engine's stop (a health
+// alert reading the database, say) must find it stopped, not create it and
+// start delivering after the owner lock is gone (#2530).
 func (h *Home) stopConductorDeliveries(wait time.Duration) (undelivered, dropped, unconfirmed int) {
-	if h.conductorDeliveries == nil {
-		return 0, 0, 0
-	}
+	q := h.deliveryQueue()
 	type left struct{ undelivered, dropped, unconfirmed int }
 	per := map[string]*left{}
 	entry := func(conductor string) *left {
@@ -13896,7 +13894,7 @@ func (h *Home) stopConductorDeliveries(wait time.Duration) (undelivered, dropped
 		}
 		return per[conductor]
 	}
-	queued, inflight, drops := h.conductorDeliveries.stop(wait)
+	queued, inflight, drops := q.stop(wait)
 	for _, d := range queued {
 		entry(d.Conductor).undelivered++
 		undelivered++
