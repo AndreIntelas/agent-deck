@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -30,7 +32,7 @@ func remoteCommandArgs(args []string) ([]string, error) {
 		case "session":
 			if len(args) > 1 {
 				switch args[1] {
-				case "show", "output", "send", "image-upload", "start", "stop", "restart", "fork", "archive", "unarchive", "set", "context", "metrics", "viewers", "annotate":
+				case "show", "output", "send", "send-status", "image-upload", "start", "stop", "restart", "fork", "archive", "unarchive", "set", "context", "metrics", "viewers", "annotate":
 					return append([]string(nil), args...), nil
 				case "switch", "switch-preview", "switch-account":
 					if err := validateRemoteSwitchArgs(args[1], args[2:]); err != nil {
@@ -71,6 +73,11 @@ func remoteCommandArgs(args []string) ([]string, error) {
 		case "limits":
 			// Read-only: the remote's own accounts and quota cache.
 			if err := validateRemoteLimitsArgs(args[1:]); err != nil {
+				return nil, err
+			}
+			return append([]string(nil), args...), nil
+		case "events":
+			if err := validateRemoteEventsArgs(args[1:]); err != nil {
 				return nil, err
 			}
 			return append([]string(nil), args...), nil
@@ -285,12 +292,17 @@ func runRemoteExec(name string, args []string) (int, error) {
 	}
 	defer closeInput()
 	runner := session.NewSSHRunner(name, rc)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if remoteGuardedSend(args) {
-		if err := requireRemoteGuardSupport(context.Background(), runner, name); err != nil {
+		if err := requireRemoteGuardSupport(ctx, runner, name); err != nil {
 			return 1, err
 		}
 	}
-	interactive, err := preflightRemoteCreationMode(context.Background(), runner, args)
+	if isRemoteReadCapability(args) {
+		return runRemoteRead(ctx, runner, name, input, args)
+	}
+	interactive, err := preflightRemoteCreationMode(ctx, runner, args)
 	if err != nil {
 		return 2, err
 	}
@@ -314,7 +326,7 @@ func runRemoteExec(name string, args []string) (int, error) {
 	if isSessionAnnotateArgs(args) || isRecallArgs(args) || isRemoteLimitsArgs(args) {
 		stdout = &capturedOut
 	}
-	err = runner.RunIO(context.Background(), input, stdout, stderr, args...)
+	err = runner.RunIO(ctx, input, stdout, stderr, args...)
 	var exitErr *exec.ExitError
 	remoteFailed := errors.As(err, &exitErr) && exitErr.ExitCode() > 0
 	if remoteFailed {
