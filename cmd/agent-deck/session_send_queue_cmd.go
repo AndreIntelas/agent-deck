@@ -140,7 +140,8 @@ func ledgerQueuedSend(r *sendqueue.Record, inboxOwned bool) {
 		state = comms.StateLanded
 	case sendqueue.StateTyped:
 		state = comms.StateTyped
-	case sendqueue.StateFailed:
+	case sendqueue.StateFailed, sendqueue.StateCancelled:
+		// Cancelled is not delivered: nothing was typed.
 		state = comms.StateFailed
 	default:
 		return // No final delivery evidence to publish.
@@ -516,6 +517,14 @@ func classifyChild(result map[string]interface{}, code int) (childOutcome, strin
 // sendChild starts the child that types one queued message; tests replace it.
 var sendChild = startChildSend
 
+// sendChildRelease types an entry released by `session queue release`: the
+// guarded child (--require-input-prompt) without the readiness wait
+// (--no-wait), so a released entry is typed now only when an input prompt is
+// visible and is refused untyped otherwise. Tests replace it.
+var sendChildRelease = func(profile, id, message, resultPath string) (int, func() int, error) {
+	return startChildSendWithOptions(profile, id, message, resultPath, releaseChildOptions)
+}
+
 // deliverQueued drives one record to landed, failed (only when nothing was
 // typed), or settled typed/submitted.
 func deliverQueued(profile, dir string, rec *sendqueue.Record) {
@@ -547,6 +556,12 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 		reconcileTyping(dir, rec, set)
 	}
 	for rec.State == sendqueue.StateQueued {
+		// session queue release|cancel: the worker answers at the typing
+		// boundary, for this entry and for later ones waiting behind it.
+		if processQueueControl(profile, dir, rec) && rec.State != sendqueue.StateQueued {
+			break
+		}
+		serviceOtherQueueControls(profile, dir, rec.SessionID, rec.SendID)
 		_, instances, _, err := loadSessionData(profile)
 		if err != nil {
 			fail("cannot load sessions: " + err.Error())
@@ -568,7 +583,10 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 				return
 			}
 			_ = set(func(r *sendqueue.Record) { r.TargetStatus = status })
-			time.Sleep(poll)
+			sleepUnlessQueueControl(dir, rec.SessionID, poll)
+			continue
+		}
+		if processQueueControl(profile, dir, rec) {
 			continue
 		}
 		path := session.LiveTranscriptPath(inst, instances)
@@ -592,7 +610,7 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 			if left := time.Until(deadline); !deadline.IsZero() && left < wait {
 				wait = left // one last attempt at the end of the budget
 			}
-			time.Sleep(wait)
+			sleepUnlessQueueControl(dir, rec.SessionID, wait)
 		}
 	}
 	if rec.Final() {
@@ -617,14 +635,21 @@ func typeQueued(profile, dir string, rec *sendqueue.Record, status, path string,
 	_ = os.Remove(result)
 	if err := set(func(r *sendqueue.Record) {
 		r.State, r.Reason, r.ChildPID = sendqueue.StateTyping, "", 0
+		r.DeliveryEvidence = nil // evidence belongs to one attempt
 		r.Attempts++
 		r.TargetStatus, r.TranscriptPath, r.TranscriptFrom = status, path, from
 		r.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if status == queueReleaseStatus {
+			// A released entry keeps the guard on any later attempt too.
+			r.RequireInputPrompt = true
+		}
 	}); err != nil {
 		return false
 	}
 	child := sendChild
-	if rec.RequireInputPrompt {
+	if status == queueReleaseStatus {
+		child = sendChildRelease
+	} else if rec.RequireInputPrompt {
 		child = sendChildGuarded
 	}
 	pid, wait, err := child(profile, rec.SessionID, rec.Message, result)
@@ -649,6 +674,9 @@ func applyChildResult(rec *sendqueue.Record, result map[string]interface{}, code
 	}
 	_ = set(func(r *sendqueue.Record) {
 		r.ChildPID = 0
+		if haveResult && len(result) > 0 {
+			r.DeliveryEvidence = result
+		}
 		if id, _ := result["claude_session_id"].(string); id != "" {
 			r.ClaudeSessionID = id
 		}
@@ -831,14 +859,36 @@ func waitTurnStarted(profile, id string, max time.Duration) {
 // dies, reads the whole message regardless, and the next worker reads the
 // outcome from resultPath.
 var sendChildGuarded = func(profile, id, message, resultPath string) (int, func() int, error) {
-	return startChildSendWithGuard(profile, id, message, resultPath, true)
+	return startChildSendWithOptions(profile, id, message, resultPath, childSendOptions{requireInputPrompt: true})
 }
 
 func startChildSend(profile, id, message, resultPath string) (int, func() int, error) {
-	return startChildSendWithGuard(profile, id, message, resultPath, false)
+	return startChildSendWithOptions(profile, id, message, resultPath, childSendOptions{})
 }
 
-func startChildSendWithGuard(profile, id, message, resultPath string, requireInputPrompt bool) (int, func() int, error) {
+// childSendOptions are the extra `session send` flags a queue child carries.
+type childSendOptions struct {
+	requireInputPrompt bool // --require-input-prompt: refuse untyped without an input prompt
+	noWait             bool // --no-wait: skip the readiness wait
+}
+
+// releaseChildOptions: `session queue release` forces the guarded send and
+// skips the readiness wait, as in the lab core.
+var releaseChildOptions = childSendOptions{requireInputPrompt: true, noWait: true}
+
+// childSendArgs is the argv (after the executable) of a queue child.
+func childSendArgs(profile, id, msgPath string, opts childSendOptions) []string {
+	args := profileArgs(profile, "session", "send", id, "--message-file", msgPath, "--json", "--queue-worker")
+	if opts.requireInputPrompt {
+		args = append(args, "--require-input-prompt")
+	}
+	if opts.noWait {
+		args = append(args, "--no-wait")
+	}
+	return args
+}
+
+func startChildSendWithOptions(profile, id, message, resultPath string, opts childSendOptions) (int, func() int, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, nil, err
@@ -851,11 +901,10 @@ func startChildSendWithGuard(profile, id, message, resultPath string, requireInp
 	if err != nil {
 		return 0, nil, err
 	}
-	args := profileArgs(profile, "session", "send", id, "--message-file", msgPath, "--json", "--queue-worker")
-	if requireInputPrompt {
-		args = append(args, "--require-input-prompt")
-	}
-	cmd := exec.Command(exe, args...)
+	// exe is this agent-deck binary (os.Executable) and argv goes straight to
+	// execve with no shell: childSendArgs emits literal flags, and profile, id
+	// and msgPath are single positional or flag values.
+	cmd := exec.Command(exe, childSendArgs(profile, id, msgPath, opts)...) //nolint:gosec // G702: own binary, literal flags, no shell (see above)
 	// The send id rides in the environment, not argv: a binary that predates
 	// it ignores the variable instead of refusing an unknown flag. The rest
 	// of the environment is passed through unchanged, exactly as before

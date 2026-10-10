@@ -34,6 +34,10 @@ func remoteCommandArgs(args []string) ([]string, error) {
 				switch args[1] {
 				case "show", "output", "send", "send-status", "image-upload", "start", "stop", "restart", "fork", "archive", "unarchive", "set", "context", "metrics", "viewers", "annotate":
 					return append([]string(nil), args...), nil
+				case "queue":
+					if remoteQueueArgs(args) {
+						return append([]string(nil), args...), nil
+					}
 				case "switch", "switch-preview", "switch-account":
 					if err := validateRemoteSwitchArgs(args[1], args[2:]); err != nil {
 						return nil, err
@@ -320,10 +324,10 @@ func runRemoteExec(name string, args []string) (int, error) {
 	var stdout io.Writer = os.Stdout
 	var stderr io.Writer = os.Stderr
 	var capturedOut, capturedErr bytes.Buffer
-	if isSessionMetricsArgs(args) || isSessionPrimerArgs(args) || isSessionAnnotateArgs(args) || isRecallArgs(args) || isRemoteLimitsArgs(args) {
+	if isSessionMetricsArgs(args) || isSessionPrimerArgs(args) || isSessionAnnotateArgs(args) || isRecallArgs(args) || isRemoteLimitsArgs(args) || isSessionQueueArgs(args) {
 		stderr = &capturedErr
 	}
-	if isSessionAnnotateArgs(args) || isRecallArgs(args) || isRemoteLimitsArgs(args) {
+	if isSessionAnnotateArgs(args) || isRecallArgs(args) || isRemoteLimitsArgs(args) || isSessionQueueArgs(args) {
 		stdout = &capturedOut
 	}
 	err = runner.RunIO(ctx, input, stdout, stderr, args...)
@@ -353,6 +357,14 @@ func runRemoteExec(name string, args []string) (int, error) {
 				return 1, nil
 			}
 			return 1, errors.New(remoteLimitsUnsupportedMessage(name))
+		}
+		if remoteQueueUnsupported(args, exitErr.ExitCode(), capturedErr.String()) {
+			remoteVersion, _ := runner.CheckBinary(context.Background())
+			if wantsJSON(args) {
+				_, _ = os.Stdout.Write(remoteQueueUnsupportedJSON(name, remoteVersion))
+				return 1, nil
+			}
+			return 1, errors.New(remoteQueueUnsupportedMessage(name, remoteVersion))
 		}
 		if remoteAnnotateUnsupported(args, exitErr.ExitCode(), capturedErr.String()) {
 			// Only now is the extra round trip worth it: name the version the

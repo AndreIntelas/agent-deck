@@ -115,6 +115,8 @@ func handleSession(profile string, args []string) {
 		handleSessionSend(profile, args[1:])
 	case "send-status":
 		handleSessionSendStatus(profile, args[1:])
+	case "queue":
+		handleSessionQueue(profile, args[1:])
 	case "send-worker":
 		handleSessionSendWorker(profile, args[1:])
 	case "approve":
@@ -178,6 +180,9 @@ func printSessionHelp() {
 	fmt.Println("  send <id> <message>     Send a message to a running session (--queue: never silently lost, see send-status; --image <path>)")
 	fmt.Println("  image-upload <id>       Stage an attachment from stdin (--name <uuid>.png --json; max 20 MiB)")
 	fmt.Println("  send-status <send-id>   State of a queued send: queued, typed, submitted, landed or failed")
+	fmt.Println("  queue list <session>    List durable queued sends (--json)")
+	fmt.Println("  queue release <id>      Send a queued entry now, with confirmed delivery evidence (--json)")
+	fmt.Println("  queue cancel <id>       Cancel an unsent entry or report its delivery (--json)")
 	fmt.Println("  approve <id> [choice]   Resolve a visible Codex approval prompt")
 	fmt.Println("  output <id>             Get the last response from a session")
 	fmt.Println("  context [id]            Show what is loaded into the agent's context, ranked by cost")
@@ -1872,7 +1877,7 @@ func handleSessionShow(profile string, args []string) {
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
 	// Load sessions
-	_, instances, groupsData, err := loadSessionData(profile)
+	storage, instances, groupsData, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
 		exitCLI(1)
@@ -1894,7 +1899,7 @@ func handleSessionShow(profile string, args []string) {
 					// data too, or groupTree below is built from the wrong
 					// profile and SessionPosition can't find inst (order: -1).
 					profile = foundProfile
-					_, instances, groupsData, err = loadSessionData(profile)
+					storage, instances, groupsData, err = loadSessionData(profile)
 					if err != nil {
 						out.Error(err.Error(), ErrCodeNotFound)
 						exitCLI(1)
@@ -1959,6 +1964,15 @@ func handleSessionShow(profile string, args []string) {
 		// what actually happened is "this build predates the field".
 		"hook_status":       hookStatus,
 		"hook_status_fresh": hookStatusFresh,
+	}
+	// Durable queued sends, the same entries as `session queue list --json`.
+	if *jsonOutput {
+		queue, err := sessionQueueEntries(storage, inst.ID)
+		if err != nil {
+			out.Error(fmt.Sprintf("cannot list queued sends: %v", err), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
+		jsonData["queue"] = queue
 	}
 	for k, v := range statusFields {
 		jsonData[k] = v
