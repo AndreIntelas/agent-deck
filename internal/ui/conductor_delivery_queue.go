@@ -204,11 +204,26 @@ func (q *conductorQueue) logOverflow(msg string, args ...any) {
 
 // finished returns a channel that closes once the deliveries still running
 // when stop was called have returned, including one stop gave up waiting for.
-// It is nil before stop.
+// It is nil before stop, and nil when no delivery is being sent: after stop a
+// runner with nothing in flight only exits, it types nothing more.
 func (q *conductorQueue) finished() <-chan struct{} {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.sending() == 0 {
+		return nil
+	}
 	return q.done
+}
+
+// sending counts the deliveries being sent. q.mu must be held.
+func (q *conductorQueue) sending() int {
+	n := 0
+	for _, b := range q.backlogs {
+		if b.inflight != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // deliver contains a panic in one delivery, so it cannot end the runner and
@@ -274,8 +289,13 @@ func (q *conductorQueue) stop(wait time.Duration) (undelivered, unconfirmed []co
 			unconfirmed = append(unconfirmed, *b.inflight)
 		}
 	}
+	sending := q.sending()
 	q.mu.Unlock()
-	uiLog.Warn("conductor_delivery_stop_timeout",
-		slog.Duration("waited", wait), slog.Int("in_flight", len(unconfirmed)))
+	// A wait that expired (at once, for a zero wait) with nothing in flight
+	// only caught the runners winding down: a normal stop, not a timeout.
+	if sending > 0 {
+		uiLog.Warn("conductor_delivery_stop_timeout",
+			slog.Duration("waited", wait), slog.Int("in_flight", sending))
+	}
 	return undelivered, unconfirmed, dropped
 }

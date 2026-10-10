@@ -3,13 +3,26 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/testutil/logassert"
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
 )
+
+// captureStopLogs sends the UI and watcher host logs to a capture until the
+// test ends. Call it before anything that registers a cleanup which logs.
+func captureStopLogs(t *testing.T) *logassert.Capture {
+	t.Helper()
+	logs := logassert.NewCapture()
+	prevUI, prevWatcher := uiLog, watcherHostLog
+	uiLog, watcherHostLog = slog.New(logs), slog.New(logs)
+	t.Cleanup(func() { uiLog, watcherHostLog = prevUI, prevWatcher })
+	return logs
+}
 
 // TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine: two TUIs of one profile
 // (allow_multiple). The first owns the watcher engine. The second runs none,
@@ -96,6 +109,7 @@ func TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine(t *testing.T) {
 // delivery, or a standby TUI could take over and type into the same pane next
 // to it (review on #2638).
 func TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight(t *testing.T) {
+	logs := captureStopLogs(t)
 	port := issue2524FreePort(t)
 	env := newIssue2524Env(t, "hook-2530-inflight", map[string]string{"bind": "127.0.0.1", "port": port}, "", "")
 	home := env.home
@@ -123,6 +137,8 @@ func TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight(t *testing.T) 
 	if !errors.As(err, &running) {
 		t.Fatalf("lock after quit with a delivery in flight: %v, want it still held", err)
 	}
+	logs.AssertContains(t, "conductor_delivery_stop_timeout")
+	logs.AssertContains(t, "watcher_engine_release_deferred")
 
 	release()
 	deadline := time.Now().Add(5 * time.Second)
@@ -137,6 +153,50 @@ func TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight(t *testing.T) 
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// TestIssue2530_ASignalExitWithNothingInFlightLogsNoTimeoutOrDeferral: an
+// owner that exits on a signal (no wait) while no conductor delivery is being
+// sent releases the engine lock before Stop returns, and its log reports a
+// normal exit: no stop timeout, no deferred release. Both used to be written
+// on every such exit, the zero wait and the release check racing the runners
+// winding down (#2638).
+func TestIssue2530_ASignalExitWithNothingInFlightLogsNoTimeoutOrDeferral(t *testing.T) {
+	logs := captureStopLogs(t)
+	port := issue2524FreePort(t)
+	env := newIssue2524Env(t, "hook-2530-signal-exit", map[string]string{"bind": "127.0.0.1", "port": port}, "", "")
+	home := env.home
+	sent := &sentLog{}
+	home.conductorDeliveriesOnce.Do(func() { home.conductorDeliveries = newConductorQueue(sent.add) })
+	if home.startWatcherEngine() == nil {
+		t.Fatal("the TUI did not start the watcher host")
+	}
+	t.Cleanup(home.StopWatcherEngine)
+	lockPath, err := watcher.EngineLockPath(home.profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	postWebhook(t, port, "alice@example.com", "delivered")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(sent.texts()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the routed event never reached the conductor delivery")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	queueIdle(t, home.conductorDeliveries)
+
+	home.StopWatcherEngine()
+
+	owner, err := watcher.AcquireEngineOwner(lockPath)
+	if err != nil {
+		t.Fatalf("lock after a signal exit with nothing in flight: %v, want it released", err)
+	}
+	_ = owner.Close()
+	logs.AssertContains(t, "watcher_engine_released")
+	logs.AssertNotContains(t, "conductor_delivery_stop_timeout")
+	logs.AssertNotContains(t, "watcher_engine_release_deferred")
 }
 
 // TestIssue2530_ADeliveryArrivingAfterQuitStartsNothing: the queue is created

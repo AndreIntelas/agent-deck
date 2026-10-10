@@ -87,6 +87,8 @@ var (
 	notifLog  = logging.ForComponent(logging.CompNotif)
 	mcpUILog  = logging.ForComponent(logging.CompMCP)
 	statusLog = logging.ForComponent(logging.CompStatus)
+	// watcherHostLog is the watcher engine host's logger; tests replace it.
+	watcherHostLog = logging.ForComponent(logging.CompWatcher)
 )
 
 const (
@@ -4213,6 +4215,7 @@ func (h *Home) StartWatcherEngine() *watcher.EngineHost {
 		DB:            db,
 		DeliverEvent:  h.dispatchWatcherEvent,
 		DeliverHealth: h.dispatchHealthAlert,
+		Logger:        watcherHostLog,
 	})
 	if !h.watcherHost.CompareAndSwap(nil, host) {
 		return h.watcherHost.Load()
