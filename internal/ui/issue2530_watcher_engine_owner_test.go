@@ -1,12 +1,14 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/watcher"
 )
 
 // TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine: two TUIs of one profile
@@ -85,5 +87,54 @@ func TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine(t *testing.T) {
 	}
 	if n := env.paneCount(wantAfter); n != 1 {
 		t.Fatalf("event after the takeover delivered %d times, want once", n)
+	}
+}
+
+// TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight: a quit waits
+// a bounded time for the conductor delivery in flight, which can take longer
+// (the verify loop runs up to about 10 s). The owner lock must outlive that
+// delivery, or a standby TUI could take over and type into the same pane next
+// to it (review on #2638).
+func TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight(t *testing.T) {
+	port := issue2524FreePort(t)
+	env := newIssue2524Env(t, "hook-2530-inflight", map[string]string{"bind": "127.0.0.1", "port": port}, "", "")
+	home := env.home
+	send, started, release := blockingSend(t, &sentLog{})
+	home.conductorDeliveriesOnce.Do(func() { home.conductorDeliveries = newConductorQueue(send) })
+	if home.startWatcherEngine() == nil {
+		t.Fatal("the TUI did not start the watcher host")
+	}
+	t.Cleanup(home.StopWatcherEngine)
+	lockPath, err := watcher.EngineLockPath(home.profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	postWebhook(t, port, "alice@example.com", "in-flight")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the routed event never reached the conductor delivery")
+	}
+	home.StopWatcherEngineAndDeliveries(50 * time.Millisecond) // gives up on the hung delivery
+
+	_, err = watcher.AcquireEngineOwner(lockPath)
+	var running *watcher.AlreadyRunningError
+	if !errors.As(err, &running) {
+		t.Fatalf("lock after quit with a delivery in flight: %v, want it still held", err)
+	}
+
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		owner, err := watcher.AcquireEngineOwner(lockPath)
+		if err == nil {
+			_ = owner.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock still held after the delivery returned: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

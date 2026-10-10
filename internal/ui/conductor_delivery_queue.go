@@ -111,6 +111,8 @@ type conductorQueue struct {
 	stopped bool
 	started int // runners ever started; only grows
 	runners sync.WaitGroup
+	// done closes once every runner has returned after stop; nil before.
+	done chan struct{}
 	// warn logs overflow, never with mu held; tests replace it before use.
 	warn func(msg string, args ...any)
 }
@@ -200,6 +202,15 @@ func (q *conductorQueue) logOverflow(msg string, args ...any) {
 	warn(msg, args...)
 }
 
+// finished returns a channel that closes once the deliveries still running
+// when stop was called have returned, including one stop gave up waiting for.
+// It is nil before stop.
+func (q *conductorQueue) finished() <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.done
+}
+
 // deliver contains a panic in one delivery, so it cannot end the runner and
 // with it every later delivery to that conductor.
 func (q *conductorQueue) deliver(d conductorDelivery) {
@@ -222,6 +233,15 @@ func (q *conductorQueue) deliver(d conductorDelivery) {
 func (q *conductorQueue) stop(wait time.Duration) (undelivered, unconfirmed []conductorDelivery, dropped map[string]int) {
 	q.mu.Lock()
 	q.stopped = true
+	if q.done == nil {
+		// No runner starts after stopped is set, so Wait cannot race an Add.
+		q.done = make(chan struct{})
+		go func(done chan struct{}) {
+			q.runners.Wait()
+			close(done)
+		}(q.done)
+	}
+	done := q.done
 	conductors := make([]string, 0, len(q.backlogs))
 	for c := range q.backlogs {
 		conductors = append(conductors, c)
@@ -242,11 +262,6 @@ func (q *conductorQueue) stop(wait time.Duration) (undelivered, unconfirmed []co
 	}
 	q.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		q.runners.Wait()
-		close(done)
-	}()
 	select {
 	case <-done:
 		return undelivered, nil, dropped

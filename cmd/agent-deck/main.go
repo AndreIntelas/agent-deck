@@ -1235,6 +1235,9 @@ func main() {
 				logging.ForComponent(logging.CompWeb).Error("web_server_error",
 					slog.String("error", err.Error()))
 				fmt.Fprintf(os.Stderr, "Error: web server: %v\n", err)
+				// exitCLI skips the deferred stop, and the engine may already
+				// be receiving events: stop it and its deliveries first.
+				homeModel.StopWatcherEngineAndDeliveries(5 * time.Second)
 				exitCLI(1)
 			}
 			return

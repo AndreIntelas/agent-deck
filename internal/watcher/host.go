@@ -219,12 +219,16 @@ func (h *EngineHost) wait(reason string, log func()) {
 }
 
 // Stop leaves the election. An owner stops its engine, waits up to 5 s for
-// the relay to hand on what the engine had buffered, runs drain (when not
-// nil) and only then releases the lock: a successor never binds a port this
-// engine still holds, or delivers next to a delivery this process still has
-// in flight. Safe to call more than once and from several goroutines; later
-// calls wait for the first.
-func (h *EngineHost) Stop(drain func()) {
+// the relay to hand on what the engine had buffered, and runs drain (when not
+// nil). drain finishes or reports the deliveries this process has queued and
+// returns a channel that closes once none of them is still being sent (nil
+// when none is). Only then is the lock released: a successor never binds a
+// port this engine still holds, or types into a conductor pane next to a
+// delivery still running here. When a delivery outlives Stop, the lock is
+// released as it returns, or when the process exits, which ends it. Safe to
+// call more than once and from several goroutines; later calls wait for the
+// first.
+func (h *EngineHost) Stop(drain func() <-chan struct{}) {
 	h.stopOnce.Do(func() {
 		h.mu.Lock()
 		h.stopped = true
@@ -243,8 +247,9 @@ func (h *EngineHost) Stop(drain func()) {
 				h.log.Warn("watcher_relay_stop_timeout")
 			}
 		}
+		var inFlight <-chan struct{}
 		if drain != nil {
-			drain()
+			inFlight = drain()
 		}
 		if owner == nil {
 			// Never ran an engine: no relay will close the panel channels.
@@ -252,10 +257,28 @@ func (h *EngineHost) Stop(drain func()) {
 			close(h.panelHealth)
 			return
 		}
-		if err := owner.Close(); err != nil {
-			h.log.Warn("watcher_engine_release_failed", slog.String("error", err.Error()))
+		release := func() {
+			if err := owner.Close(); err != nil {
+				h.log.Warn("watcher_engine_release_failed", slog.String("error", err.Error()))
+			}
+			h.log.Info("watcher_engine_released", slog.String("profile", h.cfg.Profile))
 		}
-		h.log.Info("watcher_engine_released", slog.String("profile", h.cfg.Profile))
+		if inFlight == nil {
+			release()
+			return
+		}
+		select {
+		case <-inFlight:
+			release()
+		default:
+			h.log.Info("watcher_engine_release_deferred",
+				slog.String("profile", h.cfg.Profile),
+				slog.String("reason", "a conductor delivery is still in flight"))
+			go func() {
+				<-inFlight
+				release()
+			}()
+		}
 	})
 }
 

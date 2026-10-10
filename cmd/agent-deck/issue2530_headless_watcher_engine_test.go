@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -257,6 +258,37 @@ func TestIssue2530_HeadlessPicksUpTheFirstWatcherStartedLater(t *testing.T) {
 	})
 	e.post("started-later")
 	e.waitRecorded("started-later")
+}
+
+// TestIssue2530_HeadlessStopsTheEngineWhenTheWebServerFails: the engine is
+// running by the time `server.Start` fails (here: its port is taken), and
+// exitCLI skips deferred calls, so the failure path must stop the engine
+// itself before exiting: release the lock after Engine.Stop and the conductor
+// drain, not leave it to the kernel mid-delivery (review on #2638).
+func TestIssue2530_HeadlessStopsTheEngineWhenTheWebServerFails(t *testing.T) {
+	e := newIssue2530Env(t)
+	e.createWebhookWatcher()
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+
+	cmd := exec.Command(e.bin, "-p", issue2530Profile, "web", "--no-tui", "--listen", busy.Addr().String())
+	cmd.Env = e.env
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("web --no-tui on a taken port: %v, want exit status 1\n%s", err, out)
+	}
+	logData, _ := os.ReadFile(filepath.Join(e.root, "cache", "agent-deck", "debug.log"))
+	log := string(logData)
+	if !strings.Contains(log, `"msg":"watcher_engine_owner"`) {
+		t.Fatalf("the engine never started, so this test proves nothing\n%s\n%s", out, log)
+	}
+	if !strings.Contains(log, `"msg":"watcher_engine_released"`) {
+		t.Fatalf("web --no-tui exited on the web server error without stopping the watcher engine\n%s", out)
+	}
 }
 
 // TestIssue2530_TwoProcessesRunOneEngineAndTheOtherTakesOver: two long-lived

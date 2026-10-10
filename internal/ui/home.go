@@ -4221,29 +4221,35 @@ func (h *Home) StartWatcherEngine() *watcher.EngineHost {
 	return host
 }
 
-// StopWatcherEngine leaves the engine election on a signal exit: an owner
-// stops its engine and releases the lock, so another process can take over
-// at once. Queued conductor deliveries are not waited for (#2537).
+// StopWatcherEngine leaves the engine election on a signal exit. It does not
+// wait for the conductor delivery in flight, but reports what is left, and an
+// owner keeps the lock until that delivery returns or the process exits, so
+// another process cannot type into the same pane next to it (#2530).
 func (h *Home) StopWatcherEngine() {
-	h.stopWatcherEngine(nil)
+	h.StopWatcherEngineAndDeliveries(0)
 }
 
 // StopWatcherEngineAndDeliveries is the clean-exit variant used by quit and
-// by the headless server: it also finishes the conductor delivery in flight
-// and reports what is left (stopConductorDeliveries) before the owner lock is
-// released, so a successor never delivers next to it.
+// by the headless server: it also waits up to wait for the conductor delivery
+// in flight and reports what is left (stopConductorDeliveries). The owner
+// lock is released once no delivery is still being sent, so a successor
+// never delivers next to one.
 func (h *Home) StopWatcherEngineAndDeliveries(wait time.Duration) {
-	h.stopWatcherEngine(func() { h.stopConductorDeliveries(wait) })
+	h.stopWatcherEngine(func() <-chan struct{} {
+		h.stopConductorDeliveries(wait)
+		if h.conductorDeliveries == nil {
+			return nil
+		}
+		return h.conductorDeliveries.finished()
+	})
 }
 
-func (h *Home) stopWatcherEngine(drain func()) {
+func (h *Home) stopWatcherEngine(drain func() <-chan struct{}) {
 	if host := h.watcherHost.Load(); host != nil {
 		host.Stop(drain)
 		return
 	}
-	if drain != nil {
-		drain()
-	}
+	drain()
 }
 
 // propagateThemeToSessions updates COLORFGBG in all running tmux sessions

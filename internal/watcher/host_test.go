@@ -145,11 +145,12 @@ func TestEngineHost_OneEnginePerProfileAndTakeover(t *testing.T) {
 		t.Fatalf("watcher_events holds %d rows, want 1", n)
 	}
 
-	first.Stop(func() {
+	first.Stop(func() <-chan struct{} {
 		// Still holding the lock, so the standby cannot have bound it.
 		if env.listening() {
 			t.Error("the webhook port still listens after its owner's engine stopped")
 		}
+		return nil
 	})
 	deadline := time.Now().Add(5 * time.Second)
 	for second.Engine() == nil {
@@ -198,7 +199,7 @@ func TestEngineHost_StopReleasesTheLockLast(t *testing.T) {
 	}
 
 	drained := false
-	h.Stop(func() {
+	h.Stop(func() <-chan struct{} {
 		drained = true
 		if env.listening() {
 			t.Error("drain ran while the engine still held the webhook port")
@@ -208,6 +209,7 @@ func TestEngineHost_StopReleasesTheLockLast(t *testing.T) {
 		if !errors.As(err, &running) {
 			t.Errorf("lock during drain: %v, want it still held", err)
 		}
+		return nil
 	})
 	if !drained {
 		t.Fatal("Stop did not run drain")
@@ -220,6 +222,53 @@ func TestEngineHost_StopReleasesTheLockLast(t *testing.T) {
 	for range h.PanelEvents() {
 	}
 	for range h.PanelHealth() {
+	}
+}
+
+// TestEngineHost_StopKeepsTheLockWhileADeliveryIsInFlight: when drain
+// reports a conductor delivery still being sent, Stop returns but the lock
+// stays held until that delivery returns, so a standby cannot type into the
+// same pane next to it (review on #2638).
+func TestEngineHost_StopKeepsTheLockWhileADeliveryIsInFlight(t *testing.T) {
+	env := newHostTestEnv(t, "hostinflight")
+	lockPath, err := EngineLockPath(env.profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _ := env.host(t)
+	h.Start()
+	if !h.IsOwner() {
+		t.Fatal("host did not take the engine")
+	}
+	delivering := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		h.Stop(func() <-chan struct{} { return delivering })
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop waited for the delivery in flight instead of returning")
+	}
+	_, err = AcquireEngineOwner(lockPath)
+	var running *AlreadyRunningError
+	if !errors.As(err, &running) || running.PID != os.Getpid() {
+		t.Fatalf("lock while a delivery is in flight: %v, want it still held by pid %d", err, os.Getpid())
+	}
+
+	close(delivering)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		owner, err := AcquireEngineOwner(lockPath)
+		if err == nil {
+			_ = owner.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock still held after the delivery returned: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -353,7 +402,7 @@ func TestEngineHost_StopIsIdempotent(t *testing.T) {
 	done := make(chan struct{})
 	for i := 0; i < 2; i++ {
 		go func() {
-			h.Stop(func() { drains++ })
+			h.Stop(func() <-chan struct{} { drains++; return nil })
 			done <- struct{}{}
 		}()
 	}
