@@ -419,6 +419,102 @@ func TestIssue2537_ARoutedEventOutlastsASessionLoadError(t *testing.T) {
 	}
 }
 
+// TestIssue2537_ASuccessorWaitingOnAHandoffStillAnswersQueueControls: while
+// the successor's worker waits for the replaced session's worker to hand
+// E1 over, a cancel for the successor's own E2 is answered at once, not
+// left to time out.
+func TestIssue2537_ASuccessorWaitingOnAHandoffStillAnswersQueueControls(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	f, source, successor := newHandoffFixture(t, "_test_2537_handoff_control")
+	starts := stubChild(t, 0)
+	prevStart := startSendWorker
+	startSendWorker = func(string, string) error { return nil }
+	t.Cleanup(func() { startSendWorker = prevStart })
+
+	f.queueRoutedEvent(t, source, "watcher:w-hook:e1", "E1")
+	e2 := f.queueRoutedEvent(t, successor, "watcher:w-hook:e2", "E2")
+	sourceWorker, ok, err := sendqueue.TryLock(f.dir, source.ID)
+	if err != nil || !ok {
+		t.Fatalf("hold the replaced session's worker lock: %v %v", ok, err)
+	}
+	t.Cleanup(func() { _ = sourceWorker.Release() })
+	done := make(chan struct{})
+	go func() { runSendWorker(f.profile, f.dir, successor.ID); close(done) }()
+	t.Cleanup(func() {
+		_ = sourceWorker.Release()
+		<-done
+	})
+
+	if err := requestQueueControl(f.dir, e2.SendID, "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(sendqueue.ControlResultPath(f.dir, e2.SendID)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the cancel was not answered while the worker waited on the handoff")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, err := sendqueue.Load(f.dir, e2.SendID)
+	if err != nil || got.State != sendqueue.StateCancelled || len(starts()) != 0 {
+		t.Fatalf("E2 after the cancel: %+v (%v), %d child starts; want it cancelled, nothing typed", got, err, len(starts()))
+	}
+}
+
+// TestIssue2537_AHungChildSendIsKilledAndTheQueueMovesOn: a `session send`
+// child that never exits is killed after the child wait, and its send
+// settles as typed with an unknown outcome, never typed again, so the
+// target's queue moves on (and a successor waiting on it is not held up
+// for good).
+func TestIssue2537_AHungChildSendIsKilledAndTheQueueMovesOn(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	t.Setenv("AGENTDECK_SEND_CHILD_WAIT", "300ms")
+	f := newRetryFixture(t, "_test_2537_hung_child_"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	var mu sync.Mutex
+	var starts int
+	var killed []int
+	prevChild := sendChild
+	sendChild = func(_, _, _, _ string) (int, func() int, error) {
+		mu.Lock()
+		starts++
+		mu.Unlock()
+		return 4242, func() int { <-hang; return 0 }, nil
+	}
+	t.Cleanup(func() { sendChild = prevChild })
+	prevKill := killChild
+	killChild = func(pid int) {
+		mu.Lock()
+		killed = append(killed, pid)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { killChild = prevKill })
+
+	rec := f.queue(t, time.Hour, "cli")
+	done := make(chan struct{})
+	go func() { deliverQueuedAsync(f.profile, f.dir, rec); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the worker stayed on a hung child send")
+	}
+	got, err := sendqueue.Load(f.dir, rec.SendID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got.State != sendqueue.StateTyped || starts != 1 || len(killed) != 1 || killed[0] != 4242 {
+		t.Fatalf("after the child wait: record %+v, %d child starts, killed %v; want it typed once and the child killed", got, starts, killed)
+	}
+}
+
 // TestIssue2537_AHandoffWhoseSuccessorWorkerCannotStartIsTriedAgain: the
 // successor's worker fails to start. The event stays with the replaced
 // session, untyped, instead of moving to a session no worker serves, and

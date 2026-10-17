@@ -251,7 +251,7 @@ func processQueueControl(profile, dir string, rec *sendqueue.Record) bool {
 		queueControlReply(dir, rec.SendID, queueControlResult{Outcome: "refused", Reason: reason, Record: rec})
 		return true
 	}
-	_, instances, _, err := loadSessionData(profile)
+	instances, err := loadSessions(profile)
 	if err != nil {
 		return refuse(err.Error())
 	}

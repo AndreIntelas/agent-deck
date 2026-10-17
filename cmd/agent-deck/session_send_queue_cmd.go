@@ -324,8 +324,12 @@ func runSendWorker(profile, dir, target string) {
 				// A replaced session's worker is still handing its routed
 				// events over: they are older, so they go first. That
 				// worker always gets to them: a queued `session send` has a
-				// retry budget, and a routed event is handed over at once.
-				time.Sleep(sendWorkerPoll())
+				// retry budget, a child send is waited for at most
+				// sendChildWaitMax, and a routed event is handed over at
+				// once. Cancel and release requests for this target are
+				// answered meanwhile.
+				serviceOtherQueueControls(profile, dir, target, "")
+				sleepUnlessQueueControl(dir, target, sendWorkerPoll())
 				continue
 			}
 			rec := nextPending(dir, target)
@@ -761,9 +765,43 @@ func typeQueued(profile, dir string, rec *sendqueue.Record, status, path string,
 		return true
 	}
 	_ = set(func(r *sendqueue.Record) { r.ChildPID = pid })
-	code := wait()
+	code, exited := waitChild(pid, wait, sendChildWaitMax())
+	if !exited {
+		// A child still running after the longest wait the queue allows
+		// is killed, and the send settles as typed with an unknown
+		// outcome, as a restarted worker settles it: never typed again,
+		// and the target's queue moves on.
+		if res, ok := parseChildResult(result); ok {
+			applyChildResult(rec, res, 0, true, set)
+		} else {
+			applyChildResult(rec, nil, 0, false, set)
+		}
+		return true
+	}
 	applyChildResult(rec, readChildResult(result), code, true, set)
 	return true
+}
+
+// killChild ends a hung `session send` child; tests replace it.
+var killChild = func(pid int) {
+	if pid > 1 {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+// waitChild waits up to max for a `session send` child to exit and returns
+// its exit code. When the child is still running at max it is killed, and
+// exited is false.
+func waitChild(pid int, wait func() int, max time.Duration) (code int, exited bool) {
+	done := make(chan int, 1)
+	go func() { done <- wait() }()
+	select {
+	case code := <-done:
+		return code, true
+	case <-time.After(max):
+		killChild(pid)
+		return 0, false
+	}
 }
 
 // applyChildResult moves a typing record on from its child's result.

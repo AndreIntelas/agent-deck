@@ -2461,6 +2461,7 @@ func loadSessionData(profile string) (*session.Storage, []*session.Instance, []*
 
 	instances, groupsData, err := storage.LoadWithGroups()
 	if err != nil {
+		_ = storage.Close()
 		return nil, nil, nil, fmt.Errorf("failed to load sessions: %w", err)
 	}
 
