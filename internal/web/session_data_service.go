@@ -375,7 +375,7 @@ func toMenuSession(inst *session.Instance) *MenuSession {
 		TmuxSocketName:     inst.TmuxSocketName,
 		CreatedAt:          inst.CreatedAt,
 		LastAccessedAt:     inst.LastAccessedAt,
-		ArchivedAt:         inst.ArchivedAt,
+		ArchivedAt:         inst.ArchivedAtThreadSafe(),
 		IsConductor:        inst.IsConductor,
 		ClaudeSessionID:    inst.ClaudeSessionID,
 		GeminiSessionID:    inst.GeminiSessionID,

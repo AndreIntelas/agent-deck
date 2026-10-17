@@ -2,23 +2,25 @@ package session
 
 import "time"
 
-// IsArchived reports whether the session is in the user archive.
+// IsArchived reports whether the session is in the user archive. It reads
+// ArchivedAt under the instance lock: the TUI renders, filters and looks up
+// conductors on other goroutines than the background commands that archive,
+// unarchive, restart from the archive or switch harness, which write it
+// through SetArchivedAtThreadSafe.
 func (i *Instance) IsArchived() bool {
-	return i != nil && !i.ArchivedAt.IsZero()
-}
-
-// IsArchivedThreadSafe is IsArchived for a reader on another goroutine than
-// the one archiving the session, such as the watcher's conductor lookup on its
-// relay. Writers that run off the UI goroutine (archive, unarchive, restart
-// from the archive, cross-harness switch) set ArchivedAt through
-// SetArchivedAtThreadSafe, the other half of the pair.
-func (i *Instance) IsArchivedThreadSafe() bool {
 	if i == nil {
 		return false
 	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return !i.ArchivedAt.IsZero()
+}
+
+// ArchivedAtThreadSafe returns ArchivedAt, read under the instance lock.
+func (i *Instance) ArchivedAtThreadSafe() time.Time {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.ArchivedAt
 }
 
 // SetArchivedAtThreadSafe sets ArchivedAt under the instance lock. The zero
@@ -39,7 +41,7 @@ func FilterInstancesByArchive(instances []*Instance, archived bool) []*Instance 
 		if inst == nil {
 			continue
 		}
-		isArchived := !inst.ArchivedAt.IsZero()
+		isArchived := inst.IsArchived()
 		if archived == isArchived {
 			out = append(out, inst)
 		}

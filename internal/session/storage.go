@@ -1161,7 +1161,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 		WorktreeRepo:        inst.WorktreeRepoRoot,
 		WorktreeBranch:      inst.WorktreeBranch,
 		Account:             inst.Account,
-		ArchivedAt:          inst.ArchivedAt,
+		ArchivedAt:          inst.ArchivedAtThreadSafe(),
 		Pin:                 string(inst.Pin),
 		ToolData:            toolData,
 	}, nil

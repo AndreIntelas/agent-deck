@@ -14059,7 +14059,7 @@ func findConductorTmuxSession(instances []*session.Instance, sessionTitle string
 		// Title and ArchivedAt are written under the instance's own lock
 		// (SetTitleThreadSafe, SetArchivedAtThreadSafe), not instancesMu:
 		// renames, title sync, archive and restart run off the UI goroutine.
-		if inst.GetTitleThreadSafe() != sessionTitle || inst.IsArchivedThreadSafe() {
+		if inst.GetTitleThreadSafe() != sessionTitle || inst.IsArchived() {
 			continue
 		}
 		if ts := inst.GetTmuxSession(); ts != nil && ts.Name != "" {
@@ -17099,7 +17099,7 @@ func (h *Home) persistArchived(inst *session.Instance) error {
 	if db == nil {
 		return nil
 	}
-	return db.SetArchived(inst.ID, inst.ArchivedAt)
+	return db.SetArchived(inst.ID, inst.ArchivedAtThreadSafe())
 }
 
 // archiveSession stops a session and marks it archived.
@@ -17440,7 +17440,7 @@ func restartWithArchiveTransition(
 		return false, restart()
 	}
 
-	archivedAt := inst.ArchivedAt
+	archivedAt := inst.ArchivedAtThreadSafe()
 	inst.SetArchivedAtThreadSafe(time.Time{})
 	if err := persist(inst); err != nil {
 		inst.SetArchivedAtThreadSafe(archivedAt)
