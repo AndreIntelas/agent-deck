@@ -128,6 +128,85 @@ func TestIssue2537_WorkerFailsAStoppedConductorWhenTheDeadlinePasses(t *testing.
 	}
 }
 
+// TestIssue2537_AnEventForAReplacedConductorSessionMovesToItsSuccessor: a
+// cross-harness switch archived the conductor session the event was queued
+// for, kept its pane running, and activated a successor under the same
+// title. The worker moves the event to the successor and starts the
+// successor's worker, typing nothing into the replaced pane; that worker
+// then delivers it once.
+func TestIssue2537_AnEventForAReplacedConductorSessionMovesToItsSuccessor(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	t.Setenv("AGENTDECK_SEND_RETRY_BACKOFF_MAX", "100ms")
+	t.Setenv("AGENTDECK_SEND_LAND_WINDOW", "300ms")
+	skipIfNoTmuxBinaryCLI(t)
+	profile := "_test_2537_handoff_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	source := session.NewInstanceWithTool("conductor-demo", t.TempDir(), "shell")
+	successor := session.NewInstanceWithTool("conductor-demo", t.TempDir(), "shell")
+	for _, inst := range []*session.Instance{source, successor} {
+		inst.Status = session.StatusRunning
+		inst.GroupPath = session.DefaultGroupPath
+		pane := inst.GetTmuxSession()
+		if err := pane.Start("bash"); err != nil {
+			t.Fatalf("start a conductor pane: %v", err)
+		}
+		t.Cleanup(func() { _ = pane.Kill() })
+	}
+	source.ArchivedAt, source.SupersededBy = time.Now().UTC(), successor.ID
+	successor.Supersedes = source.ID
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionData(storage, []*session.Instance{source, successor}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = storage.Close()
+	f := retryFixture{profile: profile, dir: t.TempDir(), target: source}
+	starts := stubChild(t, 0)
+	var mu sync.Mutex
+	var workers []string
+	prev := startSendWorker
+	startSendWorker = func(_, id string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		workers = append(workers, id)
+		return nil
+	}
+	t.Cleanup(func() { startSendWorker = prev })
+
+	rec := f.queueWatcherEvent(t, 0)
+	done := make(chan struct{})
+	go func() { deliverQueued(f.profile, f.dir, rec); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the worker held on to the event of a replaced conductor session")
+	}
+	moved, err := sendqueue.Load(f.dir, rec.SendID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(starts()); n != 0 || moved.SessionID != successor.ID || moved.State != sendqueue.StateQueued {
+		t.Fatalf("after the handoff: %d child starts, record %+v; want it queued for %s, nothing typed", n, moved, successor.ID)
+	}
+	mu.Lock()
+	started := strings.Join(workers, ",")
+	mu.Unlock()
+	if started != successor.ID {
+		t.Fatalf("workers started for %q, want only the successor %s", started, successor.ID)
+	}
+
+	deliverQueued(f.profile, f.dir, moved)
+	got, err := sendqueue.Load(f.dir, rec.SendID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(starts()); n != 1 || got.SessionID != successor.ID || got.State != sendqueue.StateSubmitted {
+		t.Fatalf("the successor's worker: %d child starts, record %+v; want it submitted once", n, got)
+	}
+}
+
 // TestIssue2537_AWorkerThatDiedMidDeliveryNeverTypesTheEventAgain: the
 // worker died after the routed event's record moved to typing, and its child
 // left no result. The next worker settles it as typed with an unknown

@@ -515,7 +515,27 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 			fail("target removed")
 			return
 		}
-		if !inst.Exists() {
+		// A routed watcher event is for the conductor, not for one session of
+		// it (#2537). A cross-harness switch archives the conductor's session
+		// but keeps its pane, and activates a successor under the same title:
+		// the event moves to the successor, whose worker delivers it, instead
+		// of reaching the replaced harness or waiting on the archived session
+		// for good. An archived conductor with no successor is waited for
+		// like a stopped one.
+		archived := rec.WaitWhileStopped && inst.IsArchived()
+		if archived {
+			if next := handoffSuccessor(instances, inst); next != nil {
+				if err := set(func(r *sendqueue.Record) {
+					r.SessionID, r.SessionTitle, r.Tool, r.TargetStatus = next.ID, next.Title, next.Tool, ""
+				}); err != nil {
+					sleepUnlessQueueControl(dir, rec.SessionID, poll)
+					continue
+				}
+				_ = startSendWorker(profile, next.ID)
+				return
+			}
+		}
+		if archived || !inst.Exists() {
 			if !rec.WaitWhileStopped {
 				fail("target not running")
 				return
@@ -587,6 +607,29 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 // targetStatusStopped is the target_status of a send waiting for a target
 // that is not running (Record.WaitWhileStopped).
 const targetStatusStopped = "stopped"
+
+// startSendWorker starts a target's send worker; tests replace it.
+var startSendWorker = sendqueue.SpawnWorker
+
+// handoffSuccessor follows inst's cross-harness lineage (SupersededBy) to the
+// session that replaced it, past successors that were replaced in turn. It
+// returns nil when inst was not replaced, or when the lineage ends in a
+// missing or archived session or loops.
+func handoffSuccessor(instances []*session.Instance, inst *session.Instance) *session.Instance {
+	seen := map[string]bool{inst.ID: true}
+	for next := inst.SupersededBy; next != "" && !seen[next]; {
+		s := instanceByID(instances, next)
+		if s == nil {
+			return nil
+		}
+		if !s.IsArchived() {
+			return s
+		}
+		seen[next] = true
+		next = s.SupersededBy
+	}
+	return nil
+}
 
 func shouldWaitForIdle(tool, status string) bool {
 	return status == "" || status == "unknown" || status == "starting" || (status == "running" && !session.AcceptsInputWhileBusy(tool))
