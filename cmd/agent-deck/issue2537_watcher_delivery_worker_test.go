@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strconv"
@@ -204,6 +205,157 @@ func TestIssue2537_AnEventForAReplacedConductorSessionMovesToItsSuccessor(t *tes
 	}
 	if n := len(starts()); n != 1 || got.SessionID != successor.ID || got.State != sendqueue.StateSubmitted {
 		t.Fatalf("the successor's worker: %d child starts, record %+v; want it submitted once", n, got)
+	}
+}
+
+// newHandoffFixture is a conductor session that a cross-harness switch
+// replaced: source is archived with its pane still running, and successor is
+// the active session under the same title. Both panes run bash.
+func newHandoffFixture(t *testing.T, name string) (f retryFixture, source, successor *session.Instance) {
+	t.Helper()
+	skipIfNoTmuxBinaryCLI(t)
+	profile := name + "_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	source = session.NewInstanceWithTool("conductor-demo", t.TempDir(), "shell")
+	successor = session.NewInstanceWithTool("conductor-demo", t.TempDir(), "shell")
+	for _, inst := range []*session.Instance{source, successor} {
+		inst.Status = session.StatusRunning
+		inst.GroupPath = session.DefaultGroupPath
+		pane := inst.GetTmuxSession()
+		if err := pane.Start("bash"); err != nil {
+			t.Fatalf("start a conductor pane: %v", err)
+		}
+		t.Cleanup(func() { _ = pane.Kill() })
+	}
+	source.ArchivedAt, source.SupersededBy = time.Now().UTC(), successor.ID
+	successor.Supersedes = source.ID
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionData(storage, []*session.Instance{source, successor}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = storage.Close()
+	return retryFixture{profile: profile, dir: t.TempDir(), target: source}, source, successor
+}
+
+// queueRoutedEvent writes a routed event's record for target under key.
+func (f retryFixture) queueRoutedEvent(t *testing.T, target *session.Instance, key, message string) *sendqueue.Record {
+	t.Helper()
+	rec, created, err := sendqueue.EnqueueOnce(f.profile, f.dir, sendqueue.Send{
+		SessionID: target.ID, SessionTitle: target.Title, Tool: target.Tool,
+		Message: message, Sender: "watcher:hook", Key: key, WaitWhileStopped: true,
+	}, time.Now())
+	if err != nil || !created {
+		t.Fatalf("queue %s: created %v, %v", key, created, err)
+	}
+	return rec
+}
+
+// TestIssue2537_AReplacedSessionsEventsGoBeforeItsSuccessorsOwn: E1 waits
+// for a conductor session a switch replaced, whose worker is still running
+// (its lock is held), and E2 is routed to the successor afterwards. The
+// successor's worker types nothing while the replaced session's worker may
+// still hand E1 over; once that worker is gone it moves E1 itself, under
+// that worker's lock, and types E1 before E2.
+func TestIssue2537_AReplacedSessionsEventsGoBeforeItsSuccessorsOwn(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	t.Setenv("AGENTDECK_SEND_RETRY_BACKOFF_MAX", "100ms")
+	f, source, successor := newHandoffFixture(t, "_test_2537_handoff_order")
+	var mu sync.Mutex
+	var typed []string
+	prevChild := sendChild
+	sendChild = func(_, id, message, resultPath string) (int, func() int, error) {
+		mu.Lock()
+		typed = append(typed, message)
+		mu.Unlock()
+		_ = os.WriteFile(resultPath, []byte(`{"success":true,"submitted":true,"delivery":"submitted"}`), 0o600)
+		return 4242, func() int { return 0 }, nil
+	}
+	t.Cleanup(func() { sendChild = prevChild })
+	prevStart := startSendWorker
+	startSendWorker = func(string, string) error { return nil }
+	t.Cleanup(func() { startSendWorker = prevStart })
+	typedNow := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Join(typed, ",")
+	}
+
+	e1 := f.queueRoutedEvent(t, source, "watcher:w-hook:e1", "E1")
+	e2 := f.queueRoutedEvent(t, successor, "watcher:w-hook:e2", "E2")
+	sourceWorker, ok, err := sendqueue.TryLock(f.dir, source.ID)
+	if err != nil || !ok {
+		t.Fatalf("hold the replaced session's worker lock: %v %v", ok, err)
+	}
+	done := make(chan struct{})
+	go func() { runSendWorker(f.profile, f.dir, successor.ID); close(done) }()
+	time.Sleep(400 * time.Millisecond)
+	if got := typedNow(); got != "" {
+		t.Fatalf("typed %q while the replaced session's worker still held E1, want nothing", got)
+	}
+
+	if err := sourceWorker.Release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the successor's worker did not finish (typed %q)", typedNow())
+	}
+	if got := typedNow(); got != "E1,E2" {
+		t.Fatalf("typed %q, want E1 then E2", got)
+	}
+	for _, id := range []string{e1.SendID, e2.SendID} {
+		r, err := sendqueue.Load(f.dir, id)
+		if err != nil || r.SessionID != successor.ID || r.State != sendqueue.StateSubmitted {
+			t.Fatalf("record %s: %+v, %v; want it submitted to the successor", id, r, err)
+		}
+	}
+}
+
+// TestIssue2537_AHandoffWhoseSuccessorWorkerCannotStartIsTriedAgain: the
+// successor's worker fails to start. The event stays with the replaced
+// session, untyped, instead of moving to a session no worker serves, and
+// moves on a later poll once the worker starts.
+func TestIssue2537_AHandoffWhoseSuccessorWorkerCannotStartIsTriedAgain(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	t.Setenv("AGENTDECK_SEND_RETRY_BACKOFF_MAX", "100ms")
+	f, source, successor := newHandoffFixture(t, "_test_2537_handoff_spawn")
+	starts := stubChild(t, 0)
+	var mu sync.Mutex
+	var tries []string
+	prev := startSendWorker
+	startSendWorker = func(_, id string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		tries = append(tries, id)
+		if len(tries) == 1 {
+			return errors.New("fork failed")
+		}
+		return nil
+	}
+	t.Cleanup(func() { startSendWorker = prev })
+
+	rec := f.queueRoutedEvent(t, source, "watcher:w-hook:k1", "routed")
+	done := make(chan struct{})
+	go func() { deliverQueued(f.profile, f.dir, rec); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the worker never handed the event over")
+	}
+	got, err := sendqueue.Load(f.dir, rec.SendID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	n := len(tries)
+	mu.Unlock()
+	if n != 2 || got.SessionID != successor.ID || got.State != sendqueue.StateQueued || len(starts()) != 0 {
+		t.Fatalf("after %d worker starts: record %+v, %d child starts; want it moved on the second start, untyped", n, got, len(starts()))
 	}
 }
 

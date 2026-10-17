@@ -307,25 +307,104 @@ func handleSessionSendWorker(profile string, args []string) {
 		return
 	}
 	sendqueue.Prune(dir, time.Now().Add(-sendqueue.RetainFinished))
+	runSendWorker(profile, dir, *target)
+}
+
+// runSendWorker delivers target's queued records oldest first while it holds
+// target's worker lock, and returns when none are left or another worker
+// holds the lock.
+func runSendWorker(profile, dir, target string) {
 	for {
-		lock, ok, err := sendqueue.TryLock(dir, *target)
+		lock, ok, err := sendqueue.TryLock(dir, target)
 		if err != nil || !ok {
 			return // another worker owns this target
 		}
+		waitingSince := time.Time{}
 		for {
-			rec := nextPending(dir, *target)
+			if !adoptHandedOff(profile, dir, target) {
+				// A replaced session's worker is still handing its routed
+				// events over: they are older, so they go first.
+				if waitingSince.IsZero() {
+					waitingSince = time.Now()
+				}
+				if time.Since(waitingSince) < handoffWaitMax {
+					time.Sleep(sendWorkerPoll())
+					continue
+				}
+			}
+			waitingSince = time.Time{}
+			rec := nextPending(dir, target)
 			if rec == nil {
 				break
 			}
 			deliverQueuedAsync(profile, dir, rec)
 		}
-		startPendingWatchers(profile, dir, *target)
+		startPendingWatchers(profile, dir, target)
 		releaseQueueLock(lock)
 		// A send queued while this worker was finishing: pick it up.
-		if nextPending(dir, *target) == nil {
+		if nextPending(dir, target) == nil {
 			return
 		}
 	}
+}
+
+// handoffWaitMax bounds how long a worker waits for a replaced session's
+// worker to hand its routed events over before it delivers its own.
+const handoffWaitMax = 2 * time.Minute
+
+// adoptHandedOff moves to target the routed events still queued for
+// sessions a cross-harness switch replaced with target (#2537), so target's
+// worker delivers them, older as they are, before its own. It moves a
+// replaced session's records only under that session's worker lock, the
+// one writer of its records; when that worker is still running it hands
+// them over itself (deliverQueuedMode), and adoptHandedOff reports false
+// so the caller waits for it.
+func adoptHandedOff(profile, dir, target string) bool {
+	recs, _ := sendqueue.List(dir, "")
+	var instances []*session.Instance
+	loaded, ready := false, true
+	seen := map[string]bool{}
+	for _, r := range recs {
+		if r.State != sendqueue.StateQueued || !r.WaitWhileStopped || r.SessionID == target || seen[r.SessionID] {
+			continue
+		}
+		seen[r.SessionID] = true
+		if !loaded {
+			loaded = true
+			_, all, _, err := loadSessionData(profile)
+			if err != nil {
+				return true
+			}
+			instances = all
+		}
+		replaced := instanceByID(instances, r.SessionID)
+		if replaced == nil || !replaced.IsArchived() {
+			continue
+		}
+		next := handoffSuccessor(instances, replaced)
+		if next == nil || next.ID != target {
+			continue
+		}
+		lock, ok, err := sendqueue.TryLock(dir, replaced.ID)
+		if err != nil || !ok {
+			ready = false
+			continue
+		}
+		own, _ := sendqueue.List(dir, replaced.ID)
+		for _, o := range own {
+			if o.State == sendqueue.StateQueued && o.WaitWhileStopped {
+				_, _ = sendqueue.Update(dir, o.SendID, time.Now(), func(u *sendqueue.Record) { handOff(u, next) })
+			}
+		}
+		releaseQueueLock(lock)
+	}
+	return ready
+}
+
+// handOff readdresses a queued routed event to the session that replaced
+// its target.
+func handOff(r *sendqueue.Record, next *session.Instance) {
+	r.SessionID, r.SessionTitle, r.Tool, r.TargetStatus = next.ID, next.Title, next.Tool, ""
 }
 
 func nextPending(dir, target string) *sendqueue.Record {
@@ -520,19 +599,20 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 		// but keeps its pane, and activates a successor under the same title:
 		// the event moves to the successor, whose worker delivers it, instead
 		// of reaching the replaced harness or waiting on the archived session
-		// for good. An archived conductor with no successor is waited for
-		// like a stopped one.
+		// for good. The successor's worker is started first: if it cannot
+		// start, the event stays here and is handed over on a later poll,
+		// never left with no worker. The successor's worker waits for these
+		// older events before it delivers its own (adoptHandedOff). An
+		// archived conductor with no successor is waited for like a stopped
+		// one.
 		archived := rec.WaitWhileStopped && inst.IsArchived()
 		if archived {
 			if next := handoffSuccessor(instances, inst); next != nil {
-				if err := set(func(r *sendqueue.Record) {
-					r.SessionID, r.SessionTitle, r.Tool, r.TargetStatus = next.ID, next.Title, next.Tool, ""
-				}); err != nil {
-					sleepUnlessQueueControl(dir, rec.SessionID, poll)
-					continue
+				if err := startSendWorker(profile, next.ID); err == nil {
+					if err := set(func(r *sendqueue.Record) { handOff(r, next) }); err == nil {
+						return
+					}
 				}
-				_ = startSendWorker(profile, next.ID)
-				return
 			}
 		}
 		if archived || !inst.Exists() {
