@@ -13956,13 +13956,15 @@ func (h *Home) conductorTmuxSessionFromStorage(sessionTitle string) *tmux.Sessio
 	return findConductorTmuxSession(instances, sessionTitle)
 }
 
-// findConductorTmuxSession returns the tmux session of the instance titled
-// sessionTitle, or nil when there is none or it has no tmux session.
+// findConductorTmuxSession returns the tmux session of the non-archived
+// instance titled sessionTitle, or nil when there is none or it has no tmux
+// session. An archived session keeps the conductor's title but is not the
+// conductor any more, and it may come before the live one.
 func findConductorTmuxSession(instances []*session.Instance, sessionTitle string) *tmux.Session {
 	for _, inst := range instances {
 		// Title is written under the instance's own lock (SetTitleThreadSafe,
 		// renames and title sync), not instancesMu.
-		if inst.GetTitleThreadSafe() != sessionTitle {
+		if inst.GetTitleThreadSafe() != sessionTitle || inst.IsArchived() {
 			continue
 		}
 		if ts := inst.GetTmuxSession(); ts != nil && ts.Name != "" {

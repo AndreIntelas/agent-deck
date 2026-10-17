@@ -91,3 +91,57 @@ func TestConductorTmuxSession_HeadlessReadsStorage(t *testing.T) {
 		t.Fatalf("headless lookup loaded %d instances into Home, want it to leave them alone", n)
 	}
 }
+
+// TestConductorTmuxSession_SkipsAnArchivedConductor: an archived session
+// keeps the conductor's title. The lookup returns the live session's tmux
+// session even when the archived one comes first, and nil when only the
+// archived one is there, in a TUI and headless.
+func TestConductorTmuxSession_SkipsAnArchivedConductor(t *testing.T) {
+	conductor := func(id, tmuxName string, archived bool) *session.Instance {
+		inst := &session.Instance{
+			ID:          id,
+			Title:       session.ConductorSessionTitle("demo"),
+			ProjectPath: t.TempDir(),
+			GroupPath:   session.DefaultGroupPath,
+			Command:     "bash",
+			Tool:        "bash",
+			Status:      session.StatusIdle,
+			CreatedAt:   time.Now(),
+		}
+		inst.SetTmuxSessionForTest(&tmux.Session{Name: tmuxName})
+		if archived {
+			inst.ArchivedAt = time.Now().UTC()
+		}
+		return inst
+	}
+	check := func(t *testing.T, home *Home, set func(...*session.Instance)) {
+		t.Helper()
+		archived := conductor("conductor-demo-old", "agentdeck_conductor-demo_old", true)
+		live := conductor("conductor-demo-id", "agentdeck_conductor-demo_live", false)
+		set(archived)
+		if got := home.conductorTmuxSession("demo"); got != nil {
+			t.Fatalf("lookup with only an archived conductor = %q, want nil", got.Name)
+		}
+		set(archived, live)
+		if got := home.conductorTmuxSession("demo"); got == nil || got.Name != "agentdeck_conductor-demo_live" {
+			t.Fatalf("lookup with an archived conductor first = %v, want the live one's tmux session", got)
+		}
+	}
+
+	t.Run("tui", func(t *testing.T) {
+		home := NewHome()
+		check(t, home, func(instances ...*session.Instance) {
+			home.instancesMu.Lock()
+			home.instances = instances
+			home.instancesMu.Unlock()
+		})
+	})
+	t.Run("headless", func(t *testing.T) {
+		home, storage := newHeadlessHomeForTest(t, "_test_2530_archived_"+strconv.FormatInt(time.Now().UnixNano(), 36))
+		check(t, home, func(instances ...*session.Instance) {
+			if err := storage.Save(instances); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+}
