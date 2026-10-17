@@ -315,6 +315,110 @@ func TestIssue2537_AReplacedSessionsEventsGoBeforeItsSuccessorsOwn(t *testing.T)
 	}
 }
 
+// TestIssue2537_BothWorkersRunningKeepTheRoutedOrder: the replaced
+// session's worker and the successor's worker run at once, with E1 queued
+// on the replaced session and E2 on the successor. Whichever moves E1, the
+// successor's worker types E1 before E2 and both reach the successor.
+func TestIssue2537_BothWorkersRunningKeepTheRoutedOrder(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	t.Setenv("AGENTDECK_SEND_RETRY_BACKOFF_MAX", "100ms")
+	f, source, successor := newHandoffFixture(t, "_test_2537_handoff_both")
+	var mu sync.Mutex
+	var typed []string
+	prevChild := sendChild
+	sendChild = func(_, id, message, resultPath string) (int, func() int, error) {
+		mu.Lock()
+		typed = append(typed, message+"@"+id)
+		mu.Unlock()
+		_ = os.WriteFile(resultPath, []byte(`{"success":true,"submitted":true,"delivery":"submitted"}`), 0o600)
+		return 4242, func() int { return 0 }, nil
+	}
+	t.Cleanup(func() { sendChild = prevChild })
+	prevStart := startSendWorker
+	startSendWorker = func(string, string) error { return nil }
+	t.Cleanup(func() { startSendWorker = prevStart })
+
+	f.queueRoutedEvent(t, source, "watcher:w-hook:e1", "E1")
+	f.queueRoutedEvent(t, successor, "watcher:w-hook:e2", "E2")
+	var wg sync.WaitGroup
+	for _, id := range []string{successor.ID, source.ID} {
+		wg.Add(1)
+		go func(id string) { defer wg.Done(); runSendWorker(f.profile, f.dir, id) }(id)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the workers did not finish")
+	}
+	mu.Lock()
+	got := strings.Join(typed, ",")
+	mu.Unlock()
+	if want := "E1@" + successor.ID + ",E2@" + successor.ID; got != want {
+		t.Fatalf("typed %q, want %q", got, want)
+	}
+}
+
+// TestIssue2537_ARoutedEventOutlastsASessionLoadError: the sessions cannot
+// be read for a while. A routed event keeps waiting instead of failing, and
+// is delivered once they read again.
+func TestIssue2537_ARoutedEventOutlastsASessionLoadError(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	t.Setenv("AGENTDECK_SEND_WORKER_POLL", "40ms")
+	t.Setenv("AGENTDECK_SEND_RETRY_BACKOFF_MAX", "100ms")
+	t.Setenv("AGENTDECK_SEND_LAND_WINDOW", "300ms")
+	f := newStoppedTargetFixture(t, "_test_2537_load_error_"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	starts := stubChild(t, 0)
+	if err := f.target.GetTmuxSession().Start("bash"); err != nil {
+		t.Fatalf("start the conductor's pane: %v", err)
+	}
+	var mu sync.Mutex
+	unreadable, failed := true, 0
+	prev := loadSessions
+	loadSessions = func(profile string) ([]*session.Instance, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if unreadable {
+			failed++
+			return nil, errors.New("database is locked")
+		}
+		return prev(profile)
+	}
+	t.Cleanup(func() { loadSessions = prev })
+	rec := f.queueWatcherEvent(t, 0)
+	id := rec.SendID
+
+	done := make(chan struct{})
+	go func() { deliverQueued(f.profile, f.dir, rec); close(done) }()
+	time.Sleep(500 * time.Millisecond)
+	waiting, err := sendqueue.Load(f.dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	tries := failed
+	unreadable = false
+	mu.Unlock()
+	if waiting.State != sendqueue.StateQueued || len(starts()) != 0 || tries < 2 {
+		t.Fatalf("after %d failed loads: record %+v, %d child starts; want it still queued, retried", tries, waiting, len(starts()))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the event was not delivered once the sessions read again")
+	}
+	got, err := sendqueue.Load(f.dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != sendqueue.StateSubmitted || len(starts()) != 1 {
+		t.Fatalf("after the sessions read again: record %+v, %d child starts; want it submitted once", got, len(starts()))
+	}
+}
+
 // TestIssue2537_AHandoffWhoseSuccessorWorkerCannotStartIsTriedAgain: the
 // successor's worker fails to start. The event stays with the replaced
 // session, untyped, instead of moving to a session no worker serves, and

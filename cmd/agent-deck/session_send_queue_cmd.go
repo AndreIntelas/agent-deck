@@ -319,20 +319,15 @@ func runSendWorker(profile, dir, target string) {
 		if err != nil || !ok {
 			return // another worker owns this target
 		}
-		waitingSince := time.Time{}
 		for {
 			if !adoptHandedOff(profile, dir, target) {
 				// A replaced session's worker is still handing its routed
-				// events over: they are older, so they go first.
-				if waitingSince.IsZero() {
-					waitingSince = time.Now()
-				}
-				if time.Since(waitingSince) < handoffWaitMax {
-					time.Sleep(sendWorkerPoll())
-					continue
-				}
+				// events over: they are older, so they go first. That
+				// worker always gets to them: a queued `session send` has a
+				// retry budget, and a routed event is handed over at once.
+				time.Sleep(sendWorkerPoll())
+				continue
 			}
-			waitingSince = time.Time{}
 			rec := nextPending(dir, target)
 			if rec == nil {
 				break
@@ -348,17 +343,14 @@ func runSendWorker(profile, dir, target string) {
 	}
 }
 
-// handoffWaitMax bounds how long a worker waits for a replaced session's
-// worker to hand its routed events over before it delivers its own.
-const handoffWaitMax = 2 * time.Minute
-
 // adoptHandedOff moves to target the routed events still queued for
 // sessions a cross-harness switch replaced with target (#2537), so target's
 // worker delivers them, older as they are, before its own. It moves a
 // replaced session's records only under that session's worker lock, the
 // one writer of its records; when that worker is still running it hands
 // them over itself (deliverQueuedMode), and adoptHandedOff reports false
-// so the caller waits for it.
+// so the caller waits for it. It also reports false when the sessions
+// cannot be read, since the lineage is then unknown.
 func adoptHandedOff(profile, dir, target string) bool {
 	recs, _ := sendqueue.List(dir, "")
 	var instances []*session.Instance
@@ -371,9 +363,9 @@ func adoptHandedOff(profile, dir, target string) bool {
 		seen[r.SessionID] = true
 		if !loaded {
 			loaded = true
-			_, all, _, err := loadSessionData(profile)
+			all, err := loadSessions(profile)
 			if err != nil {
-				return true
+				return false
 			}
 			instances = all
 		}
@@ -399,6 +391,18 @@ func adoptHandedOff(profile, dir, target string) bool {
 		releaseQueueLock(lock)
 	}
 	return ready
+}
+
+// loadSessions reads the profile's sessions and closes the storage it opened
+// for that: a worker polls it for as long as a routed event waits. Tests
+// replace it.
+var loadSessions = func(profile string) ([]*session.Instance, error) {
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		return nil, err
+	}
+	_ = storage.Close()
+	return instances, nil
 }
 
 // handOff readdresses a queued routed event to the session that replaced
@@ -584,8 +588,14 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 			break
 		}
 		serviceOtherQueueControls(profile, dir, rec.SessionID, rec.SendID)
-		_, instances, _, err := loadSessionData(profile)
+		instances, err := loadSessions(profile)
 		if err != nil {
+			if rec.WaitWhileStopped && !pastDeadline() {
+				// A routed event outlasts a passing storage error: try
+				// again at the next poll instead of failing it.
+				sleepUnlessQueueControl(dir, rec.SessionID, poll)
+				continue
+			}
 			fail("cannot load sessions: " + err.Error())
 			return
 		}
@@ -923,7 +933,7 @@ func instanceByID(instances []*session.Instance, id string) *session.Instance {
 }
 
 func liveTranscriptForID(profile, id string) string {
-	_, instances, _, err := loadSessionData(profile)
+	instances, err := loadSessions(profile)
 	if err != nil {
 		return ""
 	}
