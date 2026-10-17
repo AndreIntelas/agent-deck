@@ -71,9 +71,9 @@ type EngineConfig struct {
 // the outbox failed to queue for a reason a retry can fix.
 const DefaultQueueRetryInterval = 5 * time.Second
 
-// maxUnqueued bounds the routed events waiting for such a retry, as the
-// engine's event channel is bounded. Past it a routed event is given up
-// unstored (dropUnqueued).
+// maxUnqueued bounds the routed events waiting for such a retry, per
+// conductor, as the engine's event channel is bounded. Past it a routed
+// event is given up unstored (dropUnqueued).
 const maxUnqueued = 64
 
 // eventEnvelope wraps an Event with metadata for the single-writer goroutine.
@@ -84,6 +84,8 @@ type eventEnvelope struct {
 	tracker   *HealthTracker
 	// queueFailures counts the outbox's failed attempts to queue the event.
 	queueFailures int
+	// conductor is the conductor a held event is routed to (holdUnqueued).
+	conductor string
 }
 
 // adapterEntry holds a registered adapter with its associated metadata.
@@ -149,16 +151,15 @@ type Engine struct {
 	reaper *triageReaper
 
 	// unqueued holds, in arrival order and unstored, the routed events the
-	// outbox could not queue yet; routed events arriving meanwhile wait
-	// behind them, so each conductor still gets its events in order. The
-	// writer tries them again every QueueRetryInterval. Only writerLoop
-	// uses it.
+	// outbox could not queue yet. A routed event for a conductor with held
+	// events waits behind them, so each conductor still gets its events in
+	// order; other conductors' events go on. The writer tries them again
+	// every QueueRetryInterval. Only writerLoop uses it.
 	unqueued []eventEnvelope
 
 	// unstored marks the watchers with a routed event given up unqueued and
-	// unstored (dropUnqueued): their resume cursor stays where it is for the
-	// rest of the engine's life, so a restart replays that event. Only
-	// writerLoop uses it.
+	// unstored (dropUnqueued) in this engine's life: their replay position
+	// (WatcherState.ReplayFrom) stays. Only writerLoop uses it.
 	unstored map[string]bool
 
 	ctx    context.Context
@@ -501,9 +502,11 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 	}
 
 	if e.cfg.Outbox != nil && routedTo != "" && !isTriage {
-		// While older routed events wait for the outbox, a newer one waits
-		// behind them instead of overtaking them in the send queue.
-		if len(e.unqueued) > 0 && !last {
+		// While older routed events for this conductor wait for the outbox,
+		// a newer one waits behind them instead of overtaking them in the
+		// send queue.
+		if !last && e.holding(routedTo) {
+			env.conductor = routedTo
 			e.holdUnqueued(env)
 			return
 		}
@@ -515,6 +518,7 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 			if last {
 				e.dropUnqueued(env, "the engine stopped before the send queue took it")
 			} else {
+				env.conductor = routedTo
 				e.holdUnqueued(env)
 			}
 			return
@@ -583,12 +587,21 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 			ErrorCount:     hs.ConsecutiveErrors,
 			AdapterHealthy: hs.Status != HealthStatusError,
 		}
-		if env.event.Cursor != "" && !e.resumeCursorHeld(env.watcherID) {
+		prev, err := LoadState(watcherName)
+		if err != nil {
+			prev = nil
+		}
+		if env.event.Cursor != "" {
 			snapshot.DedupCursor = env.event.Cursor
 			snapshot.DedupCursorTime = env.event.Timestamp.UTC()
-		} else if prev, err := LoadState(watcherName); err == nil && prev != nil {
+		} else if prev != nil {
 			snapshot.DedupCursor = prev.DedupCursor
 			snapshot.DedupCursorTime = prev.DedupCursorTime
+		}
+		// The replay position stays while one of this watcher's routed
+		// events waits unstored or was given up in this engine's life.
+		if prev != nil && e.replayPending(env.watcherID) {
+			snapshot.ReplayFrom = prev.ReplayFrom
 		}
 		if err := SaveState(watcherName, snapshot); err != nil {
 			e.log.Warn("state_save_failed",
@@ -647,26 +660,45 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 	}
 }
 
-// holdUnqueued keeps env, unstored, for the writer's next queue retry.
-// Past maxUnqueued waiting events it is given up.
+// holding reports whether routed events for conductor wait for a retry.
+func (e *Engine) holding(conductor string) bool {
+	for _, env := range e.unqueued {
+		if env.conductor == conductor {
+			return true
+		}
+	}
+	return false
+}
+
+// holdUnqueued keeps env, unstored, for the writer's next queue retry,
+// first recording a replay position before it. Past maxUnqueued waiting
+// events for its conductor it is given up.
 func (e *Engine) holdUnqueued(env eventEnvelope) {
-	if len(e.unqueued) >= maxUnqueued {
-		e.dropUnqueued(env, "too many routed events already wait for the send queue")
+	held := 0
+	for _, w := range e.unqueued {
+		if w.conductor == env.conductor {
+			held++
+		}
+	}
+	if held >= maxUnqueued {
+		e.dropUnqueued(env, "too many routed events for this conductor already wait for the send queue")
 		return
 	}
+	e.keepReplayPosition(env)
 	e.unqueued = append(e.unqueued, env)
 }
 
 // dropUnqueued gives up on a routed event the outbox could not queue. It is
 // not stored: a stored event is never routed again, while one that is not
-// stored is routed and queued again when its source replays it (ntfy and
-// slack resume from their cursor, which no longer moves past it). A webhook
-// cannot replay, so the warning is the only trace of such an event.
+// stored is routed and queued again when its source replays it. ntfy and
+// slack resume from the replay position kept before it (keepReplayPosition).
+// A webhook cannot replay, so the warning is the only trace of such an event.
 func (e *Engine) dropUnqueued(env eventEnvelope, reason string) {
 	if e.unstored == nil {
 		e.unstored = make(map[string]bool)
 	}
 	e.unstored[env.watcherID] = true
+	e.keepReplayPosition(env)
 	e.log.Warn("watcher_delivery_not_queued",
 		slog.String("watcher", env.tracker.Check().WatcherName),
 		slog.String("sender", env.event.Sender),
@@ -675,10 +707,10 @@ func (e *Engine) dropUnqueued(env eventEnvelope, reason string) {
 	)
 }
 
-// resumeCursorHeld reports whether watcherID's resume cursor must stay where
-// it is: one of its routed events waits unstored for the send queue or was
-// given up unstored, and a replay from the cursor is what can still route it.
-func (e *Engine) resumeCursorHeld(watcherID string) bool {
+// replayPending reports whether watcherID still needs its replay position:
+// one of its routed events waits unstored for the send queue, or was given
+// up unstored, in this engine's life.
+func (e *Engine) replayPending(watcherID string) bool {
 	if e.unstored[watcherID] {
 		return true
 	}
@@ -688,6 +720,32 @@ func (e *Engine) resumeCursorHeld(watcherID string) bool {
 		}
 	}
 	return false
+}
+
+// keepReplayPosition records in env's watcher state a replay position no
+// later than env, before env is left unstored: a restart then resumes from
+// there (resumeSince) even when the watcher has no cursor yet, or a later
+// stored event has moved its cursor past env.
+func (e *Engine) keepReplayPosition(env eventEnvelope) {
+	ts := env.event.Timestamp
+	if ts.IsZero() {
+		ts = e.clock.Now()
+	}
+	from := ts.Add(-time.Second).UTC()
+	name := env.tracker.Check().WatcherName
+	st, err := LoadState(name)
+	if err != nil || st == nil {
+		st = &WatcherState{}
+	}
+	if !st.ReplayFrom.IsZero() && !st.ReplayFrom.After(from) {
+		return
+	}
+	st.ReplayFrom = from
+	if err := SaveState(name, st); err != nil {
+		e.log.Warn("state_save_failed",
+			slog.String("watcher", name),
+			slog.String("error", err.Error()))
+	}
 }
 
 // queueDelivery hands a new event routed to a conductor to the outbox
@@ -791,6 +849,15 @@ func (e *Engine) resumeSince(cfg AdapterConfig) string {
 	}
 
 	floor := e.clock.Now().Add(-maxAge)
+	if !st.ReplayFrom.IsZero() {
+		// A routed event after this point was left unstored (#2537):
+		// replay from here, whatever the cursor says.
+		from := st.ReplayFrom
+		if from.Before(floor) {
+			from = floor
+		}
+		return strconv.FormatInt(from.Unix(), 10)
+	}
 	if st.DedupCursor != "" && (st.DedupCursorTime.IsZero() || st.DedupCursorTime.After(floor)) {
 		return st.DedupCursor
 	}
@@ -808,12 +875,8 @@ func (e *Engine) resumeSince(cfg AdapterConfig) string {
 }
 
 // advanceResumeCursor records env's resume position in state.json, keeping
-// the rest of the persisted snapshot. It leaves a held cursor alone
-// (resumeCursorHeld).
+// the rest of the persisted snapshot.
 func (e *Engine) advanceResumeCursor(env eventEnvelope) {
-	if e.resumeCursorHeld(env.watcherID) {
-		return
-	}
 	name := env.tracker.Check().WatcherName
 	st, err := LoadState(name)
 	if err != nil || st == nil {

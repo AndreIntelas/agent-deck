@@ -340,7 +340,90 @@ func TestIssue2537_AnEventTheOutboxNeverQueuedIsNotStored(t *testing.T) {
 	if calls := outbox.callCount(); calls < 3 {
 		t.Fatalf("the outbox was tried %d times, want retries and a last try at stop", calls)
 	}
-	if st, _ := LoadState(name); st != nil && st.DedupCursor == "c1" {
-		t.Fatal("the resume cursor moved past the event that was not queued")
+	st, err := LoadState(name)
+	if err != nil || st == nil || st.ReplayFrom.IsZero() || st.ReplayFrom.After(evt.Timestamp) {
+		t.Fatalf("watcher state %+v (%v); want a replay position no later than the unqueued event", st, err)
+	}
+	if got, want := engine.resumeSince(AdapterConfig{Name: name}), strconv.FormatInt(st.ReplayFrom.Unix(), 10); got != want {
+		t.Fatalf("a restart resumes from %q, want the replay position %q", got, want)
+	}
+}
+
+// conductorOutbox fails Enqueue for events routed to failFor, and records
+// the others like recordingOutbox.
+type conductorOutbox struct {
+	recordingOutbox
+	failFor string
+}
+
+func (o *conductorOutbox) Enqueue(watcherID, name string, evt Event) error {
+	if evt.RoutedTo == o.failFor {
+		return errors.New("read the record queued under this key: input/output error")
+	}
+	return o.recordingOutbox.Enqueue(watcherID, name, evt)
+}
+
+// TestIssue2537_AConductorTheOutboxFailsDoesNotHoldBackAnother: the outbox
+// keeps failing for ops but not for demo. Ops' event waits alone; demo's
+// events behind it in arrival order are queued at once, in order. When the
+// engine stops, ops' event is given up unstored, and the watcher's replay
+// position stays before it although demo's later events moved the cursor.
+func TestIssue2537_AConductorTheOutboxFailsDoesNotHoldBackAnother(t *testing.T) {
+	db := newTestDB(t)
+	name := "inbox-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	saveTestWatcher(t, db, "w1", name, "mock")
+	outbox := &conductorOutbox{recordingOutbox: recordingOutbox{db: db}, failFor: "ops"}
+	engine := NewEngine(EngineConfig{
+		DB: db,
+		Router: NewRouter(map[string]ClientEntry{
+			"alice@example.com": {Conductor: "demo", Name: "Alice"},
+			"bob@example.com":   {Conductor: "ops", Name: "Bob"},
+		}),
+		MaxEventsPerWatcher: 500,
+		TriageSpawner:       &fakeSpawner{},
+		TriageDir:           t.TempDir(),
+		ClientsPath:         filepath.Join(t.TempDir(), "clients.json"),
+		Outbox:              outbox,
+		QueueRetryInterval:  50 * time.Millisecond,
+	})
+	start := time.Now().Add(-time.Minute)
+	events := []Event{
+		{Source: "mock", Sender: "bob@example.com", Subject: "x1", Body: "X1", Timestamp: start, Cursor: "x1"},
+		{Source: "mock", Sender: "alice@example.com", Subject: "y1", Body: "Y1", Timestamp: start.Add(time.Second), Cursor: "y1"},
+		{Source: "mock", Sender: "alice@example.com", Subject: "y2", Body: "Y2", Timestamp: start.Add(2 * time.Second), Cursor: "y2"},
+	}
+	engine.RegisterAdapter("w1", &MockAdapter{events: events, listenDelay: 10 * time.Millisecond},
+		AdapterConfig{Type: "mock", Name: name}, 60)
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if queued, _ := outbox.got(); len(queued) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			engine.Stop()
+			queued, _ := outbox.got()
+			t.Fatalf("demo's events were not queued while ops' X1 waited (queued %d)", len(queued))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	engine.Stop()
+
+	queued, _ := outbox.got()
+	var order []string
+	for _, e := range queued {
+		order = append(order, e.Body)
+	}
+	if got := strings.Join(order, ","); got != "Y1,Y2" {
+		t.Fatalf("queued %q, want demo's Y1 then Y2 while ops' X1 waits", got)
+	}
+	if n := countWatcherEvents(t, db, "w1"); n != 2 {
+		t.Fatalf("watcher_events holds %d rows, want demo's two and not ops' unqueued one", n)
+	}
+	st, err := LoadState(name)
+	if err != nil || st == nil || st.ReplayFrom.IsZero() || st.ReplayFrom.After(start) {
+		t.Fatalf("watcher state %+v (%v); want a replay position no later than X1 (%s)", st, err, start)
 	}
 }
