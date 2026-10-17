@@ -507,21 +507,22 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 		// send queue.
 		if !last && e.holding(routedTo) {
 			env.conductor = routedTo
-			e.holdUnqueued(env)
-			return
-		}
-		// The outbox failed in a way a retry can fix (reading the sessions,
-		// writing the queue). The event stays unstored: a stored event is
-		// never queued again, so storing it would lose its delivery for
-		// good.
-		if e.queueDelivery(&env, routedTo) {
-			if last {
-				e.dropUnqueued(env, "the engine stopped before the send queue took it")
-			} else {
-				env.conductor = routedTo
-				e.holdUnqueued(env)
+			if e.holdUnqueued(env) {
+				return
 			}
-			return
+		} else if e.queueDelivery(&env, routedTo) {
+			// The outbox failed in a way a retry can fix (reading the
+			// sessions, writing the queue). The event stays unstored: a
+			// stored event is never queued again, so storing it would lose
+			// its delivery for good.
+			env.conductor = routedTo
+			if last {
+				if e.dropUnqueued(env, "the engine stopped before the send queue took it") {
+					return
+				}
+			} else if e.holdUnqueued(env) {
+				return
+			}
 		}
 	}
 
@@ -670,10 +671,12 @@ func (e *Engine) holding(conductor string) bool {
 	return false
 }
 
-// holdUnqueued keeps env, unstored, for the writer's next queue retry,
-// first recording a replay position before it. Past maxUnqueued waiting
-// events for its conductor it is given up.
-func (e *Engine) holdUnqueued(env eventEnvelope) {
+// holdUnqueued keeps env, unstored, for the writer's next queue retry, and
+// records a replay position before it; a failed write is tried again on
+// every retry pass. Past maxUnqueued waiting events for its conductor env is
+// given up instead (dropUnqueued). It reports false when the caller must
+// store env after all.
+func (e *Engine) holdUnqueued(env eventEnvelope) bool {
 	held := 0
 	for _, w := range e.unqueued {
 		if w.conductor == env.conductor {
@@ -681,30 +684,50 @@ func (e *Engine) holdUnqueued(env eventEnvelope) {
 		}
 	}
 	if held >= maxUnqueued {
-		e.dropUnqueued(env, "too many routed events for this conductor already wait for the send queue")
-		return
+		return e.dropUnqueued(env, "too many routed events for this conductor already wait for the send queue")
 	}
-	e.keepReplayPosition(env)
+	_ = e.keepReplayPosition(env)
 	e.unqueued = append(e.unqueued, env)
+	return true
 }
 
 // dropUnqueued gives up on a routed event the outbox could not queue. It is
-// not stored: a stored event is never routed again, while one that is not
-// stored is routed and queued again when its source replays it. ntfy and
-// slack resume from the replay position kept before it (keepReplayPosition).
-// A webhook cannot replay, so the warning is the only trace of such an event.
-func (e *Engine) dropUnqueued(env eventEnvelope, reason string) {
+// left unstored, once a replay position before it is on disk: a stored event
+// is never routed again, while one that is not stored is routed and queued
+// again when its source replays it (ntfy and slack resume from that
+// position; a webhook cannot replay, so the warning is its only trace).
+// When the position cannot be written after a few tries, dropUnqueued
+// reports false and the caller stores the event: a restart would skip it
+// anyway, and stored it at least stays in watcher_events.
+func (e *Engine) dropUnqueued(env eventEnvelope, reason string) bool {
+	var err error
+	for try := 0; try < 3; try++ {
+		if err = e.keepReplayPosition(env); err == nil {
+			break
+		}
+	}
+	name := env.tracker.Check().WatcherName
+	if err != nil {
+		e.log.Warn("watcher_delivery_not_queued",
+			slog.String("watcher", name),
+			slog.String("sender", env.event.Sender),
+			slog.Int("failures", env.queueFailures),
+			slog.String("reason", reason+"; stored, as no replay position could be written"),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
 	if e.unstored == nil {
 		e.unstored = make(map[string]bool)
 	}
 	e.unstored[env.watcherID] = true
-	e.keepReplayPosition(env)
 	e.log.Warn("watcher_delivery_not_queued",
-		slog.String("watcher", env.tracker.Check().WatcherName),
+		slog.String("watcher", name),
 		slog.String("sender", env.event.Sender),
 		slog.Int("failures", env.queueFailures),
 		slog.String("reason", reason),
 	)
+	return true
 }
 
 // replayPending reports whether watcherID still needs its replay position:
@@ -725,8 +748,8 @@ func (e *Engine) replayPending(watcherID string) bool {
 // keepReplayPosition records in env's watcher state a replay position no
 // later than env, before env is left unstored: a restart then resumes from
 // there (resumeSince) even when the watcher has no cursor yet, or a later
-// stored event has moved its cursor past env.
-func (e *Engine) keepReplayPosition(env eventEnvelope) {
+// stored event has moved its cursor past env. It returns the write error.
+func (e *Engine) keepReplayPosition(env eventEnvelope) error {
 	ts := env.event.Timestamp
 	if ts.IsZero() {
 		ts = e.clock.Now()
@@ -738,14 +761,16 @@ func (e *Engine) keepReplayPosition(env eventEnvelope) {
 		st = &WatcherState{}
 	}
 	if !st.ReplayFrom.IsZero() && !st.ReplayFrom.After(from) {
-		return
+		return nil
 	}
 	st.ReplayFrom = from
 	if err := SaveState(name, st); err != nil {
 		e.log.Warn("state_save_failed",
 			slog.String("watcher", name),
 			slog.String("error", err.Error()))
+		return err
 	}
+	return nil
 }
 
 // queueDelivery hands a new event routed to a conductor to the outbox

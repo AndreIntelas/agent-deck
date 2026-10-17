@@ -3,6 +3,7 @@ package watcher
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -425,5 +426,37 @@ func TestIssue2537_AConductorTheOutboxFailsDoesNotHoldBackAnother(t *testing.T) 
 	st, err := LoadState(name)
 	if err != nil || st == nil || st.ReplayFrom.IsZero() || st.ReplayFrom.After(start) {
 		t.Fatalf("watcher state %+v (%v); want a replay position no later than X1 (%s)", st, err, start)
+	}
+}
+
+// TestIssue2537_AnEventWhoseReplayPositionCannotBeWrittenIsStored: the
+// outbox keeps failing and the watcher's state cannot be written either
+// (state.json is a directory). Without a replay position a restart would
+// skip the event, so at stop it is stored rather than left unstored.
+func TestIssue2537_AnEventWhoseReplayPositionCannotBeWrittenIsStored(t *testing.T) {
+	db := newTestDB(t)
+	name := "inbox-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	saveTestWatcher(t, db, "w1", name, "mock")
+	dir, err := WatcherDir(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "state.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: errors.New("database is locked"), failures: -1}
+	engine := newOutboxTestEngine(t, db, outbox, 0)
+	engine.cfg.QueueRetryInterval = 50 * time.Millisecond
+	evt := Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: "no replay position", Timestamp: time.Now(), Cursor: "c1"}
+	engine.RegisterAdapter("w1", &MockAdapter{events: []Event{evt}, listenDelay: 10 * time.Millisecond},
+		AdapterConfig{Type: "mock", Name: name}, 60)
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	engine.Stop()
+
+	if n := countWatcherEvents(t, db, "w1"); n != 1 {
+		t.Fatalf("watcher_events holds %d rows, want the event stored when no replay position could be written", n)
 	}
 }
