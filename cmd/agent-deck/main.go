@@ -3143,7 +3143,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 			Color:             inst.Color,
 			Favorite:          inst.Favorite,
 			Archived:          inst.IsArchived(),
-			ArchivedAt:        inst.ArchivedAt,
+			ArchivedAt:        inst.ArchivedAtThreadSafe(),
 			SupersededBy:      inst.SupersededBy,
 			Supersedes:        inst.Supersedes,
 			CodexSessionID:    inst.CodexSessionID,
