@@ -14056,9 +14056,10 @@ func (h *Home) conductorTmuxSessionFromStorage(sessionTitle string) *tmux.Sessio
 // conductor any more, and it may come before the live one.
 func findConductorTmuxSession(instances []*session.Instance, sessionTitle string) *tmux.Session {
 	for _, inst := range instances {
-		// Title is written under the instance's own lock (SetTitleThreadSafe,
-		// renames and title sync), not instancesMu.
-		if inst.GetTitleThreadSafe() != sessionTitle || inst.IsArchived() {
+		// Title and ArchivedAt are written under the instance's own lock
+		// (SetTitleThreadSafe, SetArchivedAtThreadSafe), not instancesMu:
+		// renames, title sync, archive and restart run off the UI goroutine.
+		if inst.GetTitleThreadSafe() != sessionTitle || inst.IsArchivedThreadSafe() {
 			continue
 		}
 		if ts := inst.GetTmuxSession(); ts != nil && ts.Name != "" {
@@ -17111,7 +17112,7 @@ func (h *Home) archiveSession(inst *session.Instance) tea.Cmd {
 		if killErr := inst.Kill(); killErr != nil {
 			return sessionArchivedMsg{sessionID: id, killErr: killErr}
 		}
-		inst.ArchivedAt = time.Now().UTC()
+		inst.SetArchivedAtThreadSafe(time.Now().UTC())
 		return sessionArchivedMsg{sessionID: id}
 	}
 }
@@ -17120,7 +17121,7 @@ func (h *Home) archiveSession(inst *session.Instance) tea.Cmd {
 func (h *Home) unarchiveSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
 	return func() tea.Msg {
-		inst.ArchivedAt = time.Time{}
+		inst.SetArchivedAtThreadSafe(time.Time{})
 		return sessionUnarchivedMsg{sessionID: id}
 	}
 }
@@ -17440,14 +17441,14 @@ func restartWithArchiveTransition(
 	}
 
 	archivedAt := inst.ArchivedAt
-	inst.ArchivedAt = time.Time{}
+	inst.SetArchivedAtThreadSafe(time.Time{})
 	if err := persist(inst); err != nil {
-		inst.ArchivedAt = archivedAt
+		inst.SetArchivedAtThreadSafe(archivedAt)
 		return false, fmt.Errorf("failed to unarchive session before restart: %w", err)
 	}
 
 	if err := restart(); err != nil {
-		inst.ArchivedAt = archivedAt
+		inst.SetArchivedAtThreadSafe(archivedAt)
 		if rollbackErr := persist(inst); rollbackErr != nil {
 			return false, fmt.Errorf("restart failed: %w; restoring archive state failed: %v", err, rollbackErr)
 		}

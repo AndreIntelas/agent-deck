@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -42,6 +43,48 @@ func TestConductorTmuxSession_ReadsTitleUnderInstanceLock(t *testing.T) {
 	<-renamed
 	if got := home.conductorTmuxSession("demo"); got != ts {
 		t.Fatalf("conductor lookup returned %v, want the conductor's tmux session", got)
+	}
+}
+
+// TestConductorTmuxSession_ReadsArchiveStateUnderInstanceLock: the relay
+// looks the conductor up while background commands archive, unarchive and
+// restart sessions from the archive. Run with -race: a plain ArchivedAt read
+// or write races.
+func TestConductorTmuxSession_ReadsArchiveStateUnderInstanceLock(t *testing.T) {
+	inst := session.NewInstanceWithTool(session.ConductorSessionTitle("demo"), t.TempDir(), "shell")
+	ts := tmux.NewSession("conductor-demo", t.TempDir())
+	inst.SetTmuxSessionForTest(ts)
+	inst.ArchivedAt = time.Now().UTC()
+	home := NewHome()
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instancesMu.Unlock()
+
+	persisted := func(*session.Instance) error { return nil }
+	restartFails := func() error { return errors.New("restart failed") }
+	stop := make(chan struct{})
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		for {
+			select {
+			case <-stop:
+				home.unarchiveSession(inst)()
+				return
+			default:
+			}
+			// A failed restart from the archive unarchives, then restores
+			// the archive state: two writes per call.
+			_, _ = restartWithArchiveTransition(inst, persisted, restartFails)
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		_ = home.conductorTmuxSession("demo")
+	}
+	close(stop)
+	<-written
+	if got := home.conductorTmuxSession("demo"); got != ts {
+		t.Fatalf("conductor lookup after unarchive returned %v, want the conductor's tmux session", got)
 	}
 }
 
