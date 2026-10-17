@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,11 +20,12 @@ import (
 // recordingOutbox is an Outbox that remembers what it was given and whether
 // the event was already stored at that moment.
 type recordingOutbox struct {
-	db      *statedb.StateDB
-	mu      sync.Mutex
-	events  []Event
-	stored  []bool
-	pending map[string][]PendingDelivery
+	db         *statedb.StateDB
+	mu         sync.Mutex
+	events     []Event
+	stored     []bool
+	pending    map[string][]PendingDelivery
+	pendingErr error
 }
 
 func (o *recordingOutbox) Enqueue(watcherID, _ string, evt Event) error {
@@ -37,7 +40,7 @@ func (o *recordingOutbox) Enqueue(watcherID, _ string, evt Event) error {
 func (o *recordingOutbox) Pending() (map[string][]PendingDelivery, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.pending, nil
+	return o.pending, o.pendingErr
 }
 
 func (o *recordingOutbox) got() ([]Event, []bool) {
@@ -163,6 +166,30 @@ func TestIssue2537_HealthStateReportsUndeliveredEvents(t *testing.T) {
 	}
 }
 
+// TestIssue2537_HealthStateSaysWhenTheQueueCannotBeRead: when the send
+// queue cannot be read, the health state says so instead of carrying no
+// undelivered events, which reads as an empty queue.
+func TestIssue2537_HealthStateSaysWhenTheQueueCannotBeRead(t *testing.T) {
+	db := newTestDB(t)
+	saveTestWatcher(t, db, "w1", "inbox", "mock")
+	outbox := &recordingOutbox{db: db, pendingErr: errors.New("read sendqueue: permission denied")}
+	engine := newOutboxTestEngine(t, db, outbox, 20*time.Millisecond)
+	engine.RegisterAdapter("w1", &MockAdapter{}, AdapterConfig{Type: "mock", Name: "inbox"}, 60)
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer engine.Stop()
+
+	select {
+	case state := <-engine.HealthCh():
+		if state.Undelivered != nil || state.UndeliveredError != "read sendqueue: permission denied" {
+			t.Fatalf("health state undelivered %+v, error %q; want none and the queue's error", state.Undelivered, state.UndeliveredError)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no health state")
+	}
+}
+
 // flakyOutbox fails Enqueue with err for its first failures calls, then
 // records like recordingOutbox; failures < 0 fails every call.
 type flakyOutbox struct {
@@ -241,38 +268,79 @@ func TestIssue2537_AnEventTheOutboxFailsToQueueIsQueuedOnRetry(t *testing.T) {
 	}
 }
 
-// TestIssue2537_AnEventTheOutboxCannotQueueIsStillStored: an event for a
-// conductor with no session is stored at once, without retries, since none
-// would help. An event the outbox keeps failing for another reason is
-// retried until the engine stops, and then stored, as every received event
-// is.
-func TestIssue2537_AnEventTheOutboxCannotQueueIsStillStored(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-	}{
-		{"no conductor session", fmt.Errorf("%w: conductor %q has no session", ErrNoConductorSession, "demo")},
-		{"outbox keeps failing", errors.New("database is locked")},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			db := newTestDB(t)
-			saveTestWatcher(t, db, "w1", "inbox", "mock")
-			outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: c.err, failures: -1}
-			engine := newOutboxTestEngine(t, db, outbox, 0)
-			engine.cfg.QueueRetryInterval = 50 * time.Millisecond
-			runEvents(t, engine, Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: c.name, Timestamp: time.Now()})
+// TestIssue2537_RoutedEventsKeepTheirOrderWhileTheOutboxRecovers: E1 fails
+// to queue once; E2 arrives while E1 waits for the retry. E2 waits behind E1
+// instead of reaching the send queue first, so the conductor gets them in
+// order.
+func TestIssue2537_RoutedEventsKeepTheirOrderWhileTheOutboxRecovers(t *testing.T) {
+	db := newTestDB(t)
+	saveTestWatcher(t, db, "w1", "inbox", "mock")
+	outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: errors.New("database is locked"), failures: 1}
+	engine := newOutboxTestEngine(t, db, outbox, 0)
+	engine.cfg.QueueRetryInterval = 50 * time.Millisecond
+	now := time.Now()
+	runEvents(t, engine,
+		Event{Source: "mock", Sender: "alice@example.com", Subject: "first", Body: "E1", Timestamp: now},
+		Event{Source: "mock", Sender: "alice@example.com", Subject: "second", Body: "E2", Timestamp: now.Add(time.Second)},
+	)
 
-			if n := countWatcherEvents(t, db, "w1"); n != 1 {
-				t.Fatalf("watcher_events holds %d rows after the engine stopped, want the event", n)
-			}
-			calls := outbox.callCount()
-			if errors.Is(c.err, ErrNoConductorSession) && calls != 1 {
-				t.Fatalf("the outbox was tried %d times for a conductor with no session, want once", calls)
-			}
-			if !errors.Is(c.err, ErrNoConductorSession) && calls < 3 {
-				t.Fatalf("the outbox was tried %d times, want retries and a last try at stop", calls)
-			}
-		})
+	events, _ := outbox.got()
+	var order []string
+	for _, e := range events {
+		order = append(order, e.Body)
+	}
+	if got := strings.Join(order, ","); got != "E1,E2" {
+		t.Fatalf("queued %q after %d outbox calls, want E1 then E2", got, outbox.callCount())
+	}
+	if n := countWatcherEvents(t, db, "w1"); n != 2 {
+		t.Fatalf("watcher_events holds %d rows, want both events", n)
+	}
+}
+
+// TestIssue2537_AnEventForAConductorWithNoSessionIsStored: no retry can
+// queue an event for a conductor with no session, so it is tried once and
+// stored, as before.
+func TestIssue2537_AnEventForAConductorWithNoSessionIsStored(t *testing.T) {
+	db := newTestDB(t)
+	saveTestWatcher(t, db, "w1", "inbox", "mock")
+	outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: fmt.Errorf("%w: conductor %q has no session", ErrNoConductorSession, "demo"), failures: -1}
+	engine := newOutboxTestEngine(t, db, outbox, 0)
+	engine.cfg.QueueRetryInterval = 50 * time.Millisecond
+	runEvents(t, engine, Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: "no session", Timestamp: time.Now()})
+
+	if n := countWatcherEvents(t, db, "w1"); n != 1 || outbox.callCount() != 1 {
+		t.Fatalf("watcher_events holds %d rows after %d outbox calls, want the event stored after one", n, outbox.callCount())
+	}
+}
+
+// TestIssue2537_AnEventTheOutboxNeverQueuedIsNotStored: the outbox fails
+// until the engine stops. The event is retried, gets a last try at stop, and
+// is then left unstored, with its watcher's resume cursor not moved past it,
+// so a replay after the restart routes and queues it again. Storing it would
+// lose it for good: a stored event is never queued.
+func TestIssue2537_AnEventTheOutboxNeverQueuedIsNotStored(t *testing.T) {
+	db := newTestDB(t)
+	name := "inbox-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	saveTestWatcher(t, db, "w1", name, "mock")
+	outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: errors.New("database is locked"), failures: -1}
+	engine := newOutboxTestEngine(t, db, outbox, 0)
+	engine.cfg.QueueRetryInterval = 50 * time.Millisecond
+	evt := Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: "never queued", Timestamp: time.Now(), Cursor: "c1"}
+	engine.RegisterAdapter("w1", &MockAdapter{events: []Event{evt}, listenDelay: 10 * time.Millisecond},
+		AdapterConfig{Type: "mock", Name: name}, 60)
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	engine.Stop()
+
+	if n := countWatcherEvents(t, db, "w1"); n != 0 {
+		t.Fatalf("watcher_events holds %d rows, want the unqueued event left unstored", n)
+	}
+	if calls := outbox.callCount(); calls < 3 {
+		t.Fatalf("the outbox was tried %d times, want retries and a last try at stop", calls)
+	}
+	if st, _ := LoadState(name); st != nil && st.DedupCursor == "c1" {
+		t.Fatal("the resume cursor moved past the event that was not queued")
 	}
 }

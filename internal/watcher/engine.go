@@ -72,7 +72,8 @@ type EngineConfig struct {
 const DefaultQueueRetryInterval = 5 * time.Second
 
 // maxUnqueued bounds the routed events waiting for such a retry, as the
-// engine's event channel is bounded.
+// engine's event channel is bounded. Past it a routed event is given up
+// unstored (dropUnqueued).
 const maxUnqueued = 64
 
 // eventEnvelope wraps an Event with metadata for the single-writer goroutine.
@@ -147,9 +148,18 @@ type Engine struct {
 	// reaper processes triage result files (D-08). Set by Start().
 	reaper *triageReaper
 
-	// unqueued holds the routed events the outbox failed to queue, unstored,
-	// until the writer tries again (queueDelivery). Only writerLoop uses it.
+	// unqueued holds, in arrival order and unstored, the routed events the
+	// outbox could not queue yet; routed events arriving meanwhile wait
+	// behind them, so each conductor still gets its events in order. The
+	// writer tries them again every QueueRetryInterval. Only writerLoop
+	// uses it.
 	unqueued []eventEnvelope
+
+	// unstored marks the watchers with a routed event given up unqueued and
+	// unstored (dropUnqueued): their resume cursor stays where it is for the
+	// rest of the engine's life, so a restart replays that event. Only
+	// writerLoop uses it.
+	unstored map[string]bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -407,8 +417,8 @@ func (e *Engine) writerLoop() {
 		if retry != nil {
 			retry.Stop()
 		}
-		// Stopping: one last attempt each, then they are stored even if
-		// they could not be queued, as every received event is.
+		// Stopping: one last attempt each. One that still cannot be queued
+		// is given up unstored, so a replay can route it again.
 		waiting := e.unqueued
 		e.unqueued = nil
 		for _, env := range waiting {
@@ -447,8 +457,8 @@ func (e *Engine) writerLoop() {
 }
 
 // handleEvent routes, queues and stores one event (writerLoop). With last
-// set, an event the outbox cannot queue is stored anyway instead of waiting
-// for another try.
+// set, a routed event the outbox cannot queue is given up unstored instead
+// of waiting for another try.
 func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 	// Route the event via the router (D-08).
 	var routedTo string
@@ -490,13 +500,25 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 		routedTo = "triage"
 	}
 
-	if e.cfg.Outbox != nil && routedTo != "" && !isTriage && e.queueDelivery(&env, routedTo, last) {
-		// The outbox failed in a way a retry can fix (reading the
-		// sessions, writing the queue). The event stays unstored:
-		// a stored event is never queued again, so storing it now
-		// would lose its delivery for good.
-		e.holdUnqueued(env)
-		return
+	if e.cfg.Outbox != nil && routedTo != "" && !isTriage {
+		// While older routed events wait for the outbox, a newer one waits
+		// behind them instead of overtaking them in the send queue.
+		if len(e.unqueued) > 0 && !last {
+			e.holdUnqueued(env)
+			return
+		}
+		// The outbox failed in a way a retry can fix (reading the sessions,
+		// writing the queue). The event stays unstored: a stored event is
+		// never queued again, so storing it would lose its delivery for
+		// good.
+		if e.queueDelivery(&env, routedTo) {
+			if last {
+				e.dropUnqueued(env, "the engine stopped before the send queue took it")
+			} else {
+				e.holdUnqueued(env)
+			}
+			return
+		}
 	}
 
 	// Persist with dedup via INSERT OR IGNORE (D-10, D-23).
@@ -561,7 +583,7 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 			ErrorCount:     hs.ConsecutiveErrors,
 			AdapterHealthy: hs.Status != HealthStatusError,
 		}
-		if env.event.Cursor != "" {
+		if env.event.Cursor != "" && !e.resumeCursorHeld(env.watcherID) {
 			snapshot.DedupCursor = env.event.Cursor
 			snapshot.DedupCursorTime = env.event.Timestamp.UTC()
 		} else if prev, err := LoadState(watcherName); err == nil && prev != nil {
@@ -625,14 +647,47 @@ func (e *Engine) handleEvent(env eventEnvelope, last bool) {
 	}
 }
 
-// holdUnqueued keeps env for the writer's next queue retry. Past
-// maxUnqueued waiting events it gets its last try at once.
+// holdUnqueued keeps env, unstored, for the writer's next queue retry.
+// Past maxUnqueued waiting events it is given up.
 func (e *Engine) holdUnqueued(env eventEnvelope) {
 	if len(e.unqueued) >= maxUnqueued {
-		e.handleEvent(env, true)
+		e.dropUnqueued(env, "too many routed events already wait for the send queue")
 		return
 	}
 	e.unqueued = append(e.unqueued, env)
+}
+
+// dropUnqueued gives up on a routed event the outbox could not queue. It is
+// not stored: a stored event is never routed again, while one that is not
+// stored is routed and queued again when its source replays it (ntfy and
+// slack resume from their cursor, which no longer moves past it). A webhook
+// cannot replay, so the warning is the only trace of such an event.
+func (e *Engine) dropUnqueued(env eventEnvelope, reason string) {
+	if e.unstored == nil {
+		e.unstored = make(map[string]bool)
+	}
+	e.unstored[env.watcherID] = true
+	e.log.Warn("watcher_delivery_not_queued",
+		slog.String("watcher", env.tracker.Check().WatcherName),
+		slog.String("sender", env.event.Sender),
+		slog.Int("failures", env.queueFailures),
+		slog.String("reason", reason),
+	)
+}
+
+// resumeCursorHeld reports whether watcherID's resume cursor must stay where
+// it is: one of its routed events waits unstored for the send queue or was
+// given up unstored, and a replay from the cursor is what can still route it.
+func (e *Engine) resumeCursorHeld(watcherID string) bool {
+	if e.unstored[watcherID] {
+		return true
+	}
+	for _, env := range e.unqueued {
+		if env.watcherID == watcherID {
+			return true
+		}
+	}
+	return false
 }
 
 // queueDelivery hands a new event routed to a conductor to the outbox
@@ -642,11 +697,10 @@ func (e *Engine) holdUnqueued(env eventEnvelope) {
 // first time, and is not queued; the queue's key keeps an event stored again
 // after its row was pruned from being queued twice.
 //
-// It reports whether the caller should keep the event unstored and try
-// again: the outbox failed for a reason other than the conductor having no
-// session, and this is not the last try. A conductor with no session cannot
-// be queued for until one is created, so that event is stored as before.
-func (e *Engine) queueDelivery(env *eventEnvelope, conductor string, last bool) (retry bool) {
+// It reports whether the outbox failed in a way a retry can fix, for the
+// caller to keep the event unstored. A conductor with no session cannot be
+// queued for until one is created, so that event is stored as before.
+func (e *Engine) queueDelivery(env *eventEnvelope, conductor string) (retry bool) {
 	name := env.tracker.Check().WatcherName
 	stored, err := e.cfg.DB.HasWatcherEvent(env.watcherID, env.event.DedupKey())
 	if err != nil {
@@ -673,7 +727,7 @@ func (e *Engine) queueDelivery(env *eventEnvelope, conductor string, last bool) 
 		return false
 	}
 	env.queueFailures++
-	if !last && !errors.Is(err, ErrNoConductorSession) {
+	if !errors.Is(err, ErrNoConductorSession) {
 		if env.queueFailures == 1 {
 			e.log.Warn("watcher_delivery_queue_failed",
 				slog.String("watcher", name),
@@ -754,8 +808,12 @@ func (e *Engine) resumeSince(cfg AdapterConfig) string {
 }
 
 // advanceResumeCursor records env's resume position in state.json, keeping
-// the rest of the persisted snapshot.
+// the rest of the persisted snapshot. It leaves a held cursor alone
+// (resumeCursorHeld).
 func (e *Engine) advanceResumeCursor(env eventEnvelope) {
+	if e.resumeCursorHeld(env.watcherID) {
+		return
+	}
 	name := env.tracker.Check().WatcherName
 	st, err := LoadState(name)
 	if err != nil || st == nil {
@@ -877,7 +935,7 @@ func (e *Engine) healthLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			pending := e.pendingDeliveries()
+			pending, pendingErr := e.pendingDeliveries()
 			for i := range e.adapters {
 				entry := &e.adapters[i]
 
@@ -896,6 +954,9 @@ func (e *Engine) healthLoop() {
 
 				state := entry.tracker.Check()
 				state.Undelivered = pending[entry.watcherID]
+				if pendingErr != nil {
+					state.UndeliveredError = pendingErr.Error()
+				}
 
 				// Slice 4 (CORE-PLAN): additive tap onto the event bus —
 				// this is the "health journal" producer named in the plan.
@@ -918,17 +979,17 @@ func (e *Engine) healthLoop() {
 }
 
 // pendingDeliveries reads the outbox's undelivered events, per watcher id;
-// nil without an outbox or when the queue cannot be read.
-func (e *Engine) pendingDeliveries() map[string][]PendingDelivery {
+// nil without an outbox. The error is the queue's when it cannot be read.
+func (e *Engine) pendingDeliveries() (map[string][]PendingDelivery, error) {
 	if e.cfg.Outbox == nil {
-		return nil
+		return nil, nil
 	}
 	pending, err := e.cfg.Outbox.Pending()
 	if err != nil {
 		e.log.Warn("watcher_pending_deliveries_unreadable", slog.String("error", err.Error()))
-		return nil
+		return nil, err
 	}
-	return pending
+	return pending, nil
 }
 
 // Stop cancels all adapter contexts, calls Teardown on each adapter,
