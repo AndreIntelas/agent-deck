@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -89,11 +90,15 @@ func TestEngineOwner_HelperHoldsTheLock(t *testing.T) {
 	if path == "" {
 		t.Skip("helper process for TestEngineOwner_LockDiesWithItsProcess")
 	}
-	if _, err := AcquireEngineOwner(path); err != nil {
+	owner, err := AcquireEngineOwner(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	_, _ = os.Stdout.WriteString("locked\n")
 	time.Sleep(time.Minute) // held until the parent kills this process
+	// An unreachable owner's lock file could be finalized during the sleep,
+	// releasing the lock before the parent kills this process.
+	runtime.KeepAlive(owner)
 }
 
 // TestEngineLockPath_IsInTheProfileRuntimeDir: the lock sits next to the
