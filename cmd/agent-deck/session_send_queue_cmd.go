@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -782,16 +783,23 @@ func typeQueued(profile, dir string, rec *sendqueue.Record, status, path string,
 	return true
 }
 
-// killChild ends a hung `session send` child; tests replace it.
+// killChild ends a hung `session send` child through its process handle.
+// A child already reaped is not in liveChildren and is left alone, and the
+// handle does not signal a process that has finished. Tests replace it.
 var killChild = func(pid int) {
-	if pid > 1 {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+	if p, ok := liveChildren.Load(pid); ok {
+		_ = p.(*os.Process).Kill()
 	}
 }
 
+// childReapGrace bounds how long the worker waits for a killed child to be
+// reaped before it moves on.
+const childReapGrace = 10 * time.Second
+
 // waitChild waits up to max for a `session send` child to exit and returns
-// its exit code. When the child is still running at max it is killed, and
-// exited is false.
+// its exit code. A child still running at max is killed and then reaped,
+// for up to childReapGrace, before waitChild returns with exited false.
+// When the child finishes just as max passes, its own exit is taken.
 func waitChild(pid int, wait func() int, max time.Duration) (code int, exited bool) {
 	done := make(chan int, 1)
 	go func() { done <- wait() }()
@@ -799,9 +807,18 @@ func waitChild(pid int, wait func() int, max time.Duration) (code int, exited bo
 	case code := <-done:
 		return code, true
 	case <-time.After(max):
-		killChild(pid)
-		return 0, false
 	}
+	select {
+	case code := <-done:
+		return code, true
+	default:
+	}
+	killChild(pid)
+	select {
+	case <-done:
+	case <-time.After(childReapGrace):
+	}
+	return 0, false
 }
 
 // applyChildResult moves a typing record on from its child's result.
@@ -1054,8 +1071,11 @@ func startChildSendWithOptions(profile, id, message, resultPath string, opts chi
 	if err := cmd.Start(); err != nil {
 		return 0, nil, errors.Join(err, out.Close())
 	}
+	pid := cmd.Process.Pid
+	liveChildren.Store(pid, cmd.Process)
 	wait := func() int {
 		err := cmd.Wait()
+		liveChildren.Delete(pid)
 		// The child wrote the result through its own descriptor; the next
 		// step reads the file, so a failed close here is only reported.
 		if cerr := out.Close(); cerr != nil {
@@ -1070,8 +1090,13 @@ func startChildSendWithOptions(profile, id, message, resultPath string, opts chi
 		}
 		return 0
 	}
-	return cmd.Process.Pid, wait, nil
+	return pid, wait, nil
 }
+
+// liveChildren maps the pid of each `session send` child this process
+// started and has not reaped yet to its process handle, so killChild signals
+// the child itself, never a later process that reused the pid.
+var liveChildren sync.Map
 
 // deliveryFrames turns queued sends of one session into follow delivery
 // frames: every state change after the first scan, plus the current state

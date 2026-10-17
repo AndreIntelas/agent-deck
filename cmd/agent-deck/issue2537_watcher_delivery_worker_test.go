@@ -476,7 +476,8 @@ func TestIssue2537_AHungChildSendIsKilledAndTheQueueMovesOn(t *testing.T) {
 	t.Setenv("AGENTDECK_SEND_CHILD_WAIT", "300ms")
 	f := newRetryFixture(t, "_test_2537_hung_child_"+strconv.FormatInt(time.Now().UnixNano(), 36))
 	hang := make(chan struct{})
-	t.Cleanup(func() { close(hang) })
+	var dead sync.Once
+	t.Cleanup(func() { dead.Do(func() { close(hang) }) })
 	var mu sync.Mutex
 	var starts int
 	var killed []int
@@ -485,7 +486,7 @@ func TestIssue2537_AHungChildSendIsKilledAndTheQueueMovesOn(t *testing.T) {
 		mu.Lock()
 		starts++
 		mu.Unlock()
-		return 4242, func() int { <-hang; return 0 }, nil
+		return 4242, func() int { <-hang; return -1 }, nil
 	}
 	t.Cleanup(func() { sendChild = prevChild })
 	prevKill := killChild
@@ -493,6 +494,7 @@ func TestIssue2537_AHungChildSendIsKilledAndTheQueueMovesOn(t *testing.T) {
 		mu.Lock()
 		killed = append(killed, pid)
 		mu.Unlock()
+		dead.Do(func() { close(hang) }) // the killed child exits
 	}
 	t.Cleanup(func() { killChild = prevKill })
 
@@ -512,6 +514,37 @@ func TestIssue2537_AHungChildSendIsKilledAndTheQueueMovesOn(t *testing.T) {
 	defer mu.Unlock()
 	if got.State != sendqueue.StateTyped || starts != 1 || len(killed) != 1 || killed[0] != 4242 {
 		t.Fatalf("after the child wait: record %+v, %d child starts, killed %v; want it typed once and the child killed", got, starts, killed)
+	}
+}
+
+// TestIssue2537_WaitChildKillsAHungChildThroughItsHandleAndReapsIt: a real
+// child that outlives the wait is killed through its process handle and
+// reaped before waitChild returns, and once reaped it leaves liveChildren,
+// so no later kill can reach a process that reused its pid.
+func TestIssue2537_WaitChildKillsAHungChildThroughItsHandleAndReapsIt(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("start sleep: %v", err)
+	}
+	pid := cmd.Process.Pid
+	liveChildren.Store(pid, cmd.Process)
+	wait := func() int {
+		_ = cmd.Wait()
+		liveChildren.Delete(pid)
+		return -1
+	}
+	start := time.Now()
+	if _, exited := waitChild(pid, wait, 200*time.Millisecond); exited {
+		t.Fatal("waitChild reported a hung child as exited on its own")
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("waitChild took %s for a killed child", waited)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("the killed child was not reaped before waitChild returned")
+	}
+	if _, ok := liveChildren.Load(pid); ok {
+		t.Fatal("the reaped child is still registered for a kill")
 	}
 }
 
