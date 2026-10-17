@@ -2,6 +2,7 @@ package sendqueue
 
 import (
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -138,6 +139,37 @@ func TestEnqueueOnce_AKeyNamingNoRecordQueuesAgain(t *testing.T) {
 	}
 	if again, created, _ := EnqueueOnce("p", dir, Send{SessionID: "s1", Message: "m", Key: "k", WaitWhileStopped: true}, time.Now()); created || again.SendID != rec.SendID {
 		t.Fatalf("the replaced key does not name the new record")
+	}
+}
+
+// TestEnqueueOnce_AnUnreadableRecordIsAnErrorNotAStaleKey: a record its key
+// names that cannot be read (here its file is a directory) may still be
+// there. EnqueueOnce returns the error and keeps the key, instead of queuing
+// the send a second time.
+func TestEnqueueOnce_AnUnreadableRecordIsAnErrorNotAStaleKey(t *testing.T) {
+	t.Setenv("AGENTDECK_EVENTS_BUS", "off")
+	dir := t.TempDir()
+	send := Send{SessionID: "s1", Message: "m", Key: "k", WaitWhileStopped: true}
+	rec, _, err := EnqueueOnce("p", dir, send, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, rec.SendID+".json")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if again, created, err := EnqueueOnce("p", dir, send, time.Now()); err == nil || created || again != nil {
+		t.Fatalf("EnqueueOnce with an unreadable record: %v, created %v, %v; want the read error", again, created, err)
+	}
+	if b, err := os.ReadFile(KeyPath(dir, "k")); err != nil || string(b) != rec.SendID {
+		t.Fatalf("key after the failed call names %q (%v), want %s", b, err, rec.SendID)
+	}
+	if recs, _ := List(dir, ""); len(recs) != 0 {
+		t.Fatalf("%d records written, want none", len(recs))
 	}
 }
 

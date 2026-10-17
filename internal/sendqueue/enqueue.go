@@ -75,10 +75,22 @@ func EnqueueOnce(profile, dir string, s Send, now time.Time) (_ *Record, created
 	}
 	defer unlock()
 	keyPath := KeyPath(dir, s.Key)
-	if b, err := os.ReadFile(keyPath); err == nil {
-		if rec, err := Load(dir, strings.TrimSpace(string(b))); err == nil && rec.Key == s.Key {
+	b, err := os.ReadFile(keyPath)
+	switch {
+	case err == nil:
+		rec, err := Load(dir, strings.TrimSpace(string(b)))
+		if err == nil && rec.Key == s.Key {
 			return rec, false, nil
 		}
+		if err != nil && !errors.Is(err, ErrUnknown) {
+			// The record may still be there: replacing its key now could
+			// queue the send twice.
+			return nil, false, fmt.Errorf("sendqueue: read the record queued under key %q: %w", s.Key, err)
+		}
+		// No record (a crash between the key and the record) or one queued
+		// under another key: the key is stale.
+	case !os.IsNotExist(err):
+		return nil, false, err
 	}
 	rec, err := newRecord(dir, s, now)
 	if err != nil {
