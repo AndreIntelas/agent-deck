@@ -718,8 +718,11 @@ func handleWatcherStatus(profile string, args []string) {
 			UpdatedAt  string     `json:"updated_at"`
 			Events     []eventOut `json:"recent_events"`
 			// Undelivered: routed events still waiting in the send queue for
-			// their conductor, per conductor (#2537).
-			Undelivered []undeliveredOut `json:"undelivered"`
+			// their conductor, per conductor (#2537). It is null when the
+			// queue could not be read, with UndeliveredError saying why, so
+			// a monitor does not read that as nothing waiting.
+			Undelivered      []undeliveredOut `json:"undelivered"`
+			UndeliveredError string           `json:"undelivered_error,omitempty"`
 		}
 		out := output{
 			ID:          w.ID,
@@ -731,6 +734,9 @@ func handleWatcherStatus(profile string, args []string) {
 			CreatedAt:   w.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:   w.UpdatedAt.Format(time.RFC3339),
 			Undelivered: []undeliveredOut{},
+		}
+		if undeliveredErr != nil {
+			out.Undelivered, out.UndeliveredError = nil, undeliveredErr.Error()
 		}
 		for _, p := range undelivered {
 			out.Undelivered = append(out.Undelivered, undeliveredOut{
