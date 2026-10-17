@@ -13,14 +13,17 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
 )
 
-// captureStopLogs sends the UI and watcher host logs to a capture until the
-// test ends. Call it before anything that registers a cleanup which logs.
-func captureStopLogs(t *testing.T) *logassert.Capture {
+// captureStopLogs sends the warnings of the conductor queue q, and the log of
+// the watcher host started after it, to a capture. uiLog stays as it is:
+// deliveries an earlier test left running still log through it, and
+// replacing it under them is a data race.
+func captureStopLogs(t *testing.T, q *conductorQueue) *logassert.Capture {
 	t.Helper()
 	logs := logassert.NewCapture()
-	prevUI, prevWatcher := uiLog, watcherHostLog
-	uiLog, watcherHostLog = slog.New(logs), slog.New(logs)
-	t.Cleanup(func() { uiLog, watcherHostLog = prevUI, prevWatcher })
+	q.warn = slog.New(logs).Warn
+	prev := watcherHostLog
+	watcherHostLog = slog.New(logs)
+	t.Cleanup(func() { watcherHostLog = prev })
 	return logs
 }
 
@@ -109,12 +112,13 @@ func TestIssue2530_SecondTUIWaitsAndTakesOverTheEngine(t *testing.T) {
 // delivery, or a standby TUI could take over and type into the same pane next
 // to it (review on #2638).
 func TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight(t *testing.T) {
-	logs := captureStopLogs(t)
 	port := issue2524FreePort(t)
 	env := newIssue2524Env(t, "hook-2530-inflight", map[string]string{"bind": "127.0.0.1", "port": port}, "", "")
 	home := env.home
 	send, started, release := blockingSend(t, &sentLog{})
-	home.conductorDeliveriesOnce.Do(func() { home.conductorDeliveries = newConductorQueue(send) })
+	q := newConductorQueue(send)
+	logs := captureStopLogs(t, q)
+	home.conductorDeliveriesOnce.Do(func() { home.conductorDeliveries = q })
 	if home.startWatcherEngine() == nil {
 		t.Fatal("the TUI did not start the watcher host")
 	}
@@ -162,12 +166,13 @@ func TestIssue2530_QuitKeepsTheEngineLockWhileADeliveryIsInFlight(t *testing.T) 
 // on every such exit, the zero wait and the release check racing the runners
 // winding down (#2638).
 func TestIssue2530_ASignalExitWithNothingInFlightLogsNoTimeoutOrDeferral(t *testing.T) {
-	logs := captureStopLogs(t)
 	port := issue2524FreePort(t)
 	env := newIssue2524Env(t, "hook-2530-signal-exit", map[string]string{"bind": "127.0.0.1", "port": port}, "", "")
 	home := env.home
 	sent := &sentLog{}
-	home.conductorDeliveriesOnce.Do(func() { home.conductorDeliveries = newConductorQueue(sent.add) })
+	q := newConductorQueue(sent.add)
+	logs := captureStopLogs(t, q)
+	home.conductorDeliveriesOnce.Do(func() { home.conductorDeliveries = q })
 	if home.startWatcherEngine() == nil {
 		t.Fatal("the TUI did not start the watcher host")
 	}

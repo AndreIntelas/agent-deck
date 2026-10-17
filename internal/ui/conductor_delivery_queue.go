@@ -113,7 +113,8 @@ type conductorQueue struct {
 	runners sync.WaitGroup
 	// done closes once every runner has returned after stop; nil before.
 	done chan struct{}
-	// warn logs overflow, never with mu held; tests replace it before use.
+	// warn logs overflow and a stop timeout, never with mu held; tests
+	// replace it before use.
 	warn func(msg string, args ...any)
 }
 
@@ -151,7 +152,7 @@ func (q *conductorQueue) enqueue(d conductorDelivery) {
 	}
 	q.mu.Unlock()
 	if newNotice {
-		q.logOverflow("watcher_events_dropping_backlog_full",
+		q.logWarn("watcher_events_dropping_backlog_full",
 			slog.String("conductor", d.Conductor), slog.Int("dropped_total", total))
 	}
 }
@@ -178,7 +179,7 @@ func (q *conductorQueue) run(conductor string, b *conductorBacklog) {
 		total := q.dropped[conductor]
 		q.mu.Unlock()
 		if next.Dropped > 0 {
-			q.logOverflow("watcher_events_dropped_backlog_full",
+			q.logWarn("watcher_events_dropped_backlog_full",
 				slog.String("conductor", conductor),
 				slog.Int("dropped", next.Dropped), slog.Int("dropped_total", total))
 		}
@@ -186,10 +187,11 @@ func (q *conductorQueue) run(conductor string, b *conductorBacklog) {
 	}
 }
 
-// logOverflow writes an overflow warning through q.warn, falling back to uiLog
-// when the hook is unset, and contains a panic in the hook: logging must never
-// end the runner, which calls it outside deliver's recovery.
-func (q *conductorQueue) logOverflow(msg string, args ...any) {
+// logWarn writes a warning (overflow, stop timeout) through q.warn, falling
+// back to uiLog when the hook is unset, and contains a panic in the hook:
+// logging must never end the runner, which calls it outside deliver's
+// recovery.
+func (q *conductorQueue) logWarn(msg string, args ...any) {
 	defer func() {
 		if r := recover(); r != nil {
 			uiLog.Error("conductor_delivery_log_panic", slog.Any("panic", r))
@@ -294,7 +296,7 @@ func (q *conductorQueue) stop(wait time.Duration) (undelivered, unconfirmed []co
 	// A wait that expired (at once, for a zero wait) with nothing in flight
 	// only caught the runners winding down: a normal stop, not a timeout.
 	if sending > 0 {
-		uiLog.Warn("conductor_delivery_stop_timeout",
+		q.logWarn("conductor_delivery_stop_timeout",
 			slog.Duration("waited", wait), slog.Int("in_flight", sending))
 	}
 	return undelivered, unconfirmed, dropped
