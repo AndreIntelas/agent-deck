@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -59,7 +60,20 @@ type EngineConfig struct {
 	// each HealthState. Without one, routed events are stored and sent on
 	// EventCh but delivered to no conductor.
 	Outbox Outbox
+
+	// QueueRetryInterval is how long a routed event the outbox could not
+	// queue waits before the writer tries again. Defaults to
+	// DefaultQueueRetryInterval.
+	QueueRetryInterval time.Duration
 }
+
+// DefaultQueueRetryInterval is how often the writer retries a routed event
+// the outbox failed to queue for a reason a retry can fix.
+const DefaultQueueRetryInterval = 5 * time.Second
+
+// maxUnqueued bounds the routed events waiting for such a retry, as the
+// engine's event channel is bounded.
+const maxUnqueued = 64
 
 // eventEnvelope wraps an Event with metadata for the single-writer goroutine.
 // This avoids modifying the public Event struct with internal routing fields.
@@ -67,6 +81,8 @@ type eventEnvelope struct {
 	event     Event
 	watcherID string
 	tracker   *HealthTracker
+	// queueFailures counts the outbox's failed attempts to queue the event.
+	queueFailures int
 }
 
 // adapterEntry holds a registered adapter with its associated metadata.
@@ -130,6 +146,10 @@ type Engine struct {
 
 	// reaper processes triage result files (D-08). Set by Start().
 	reaper *triageReaper
+
+	// unqueued holds the routed events the outbox failed to queue, unstored,
+	// until the writer tries again (queueDelivery). Only writerLoop uses it.
+	unqueued []eventEnvelope
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -380,181 +400,44 @@ func (e *Engine) runAdapter(ctx context.Context, entry *adapterEntry) {
 // routes events, updates health trackers, and forwards persisted events to routedEventCh.
 func (e *Engine) writerLoop() {
 	defer e.wg.Done()
+	// retryC fires while routed events wait for the outbox to recover.
+	var retry *time.Timer
+	var retryC <-chan time.Time
+	defer func() {
+		if retry != nil {
+			retry.Stop()
+		}
+		// Stopping: one last attempt each, then they are stored even if
+		// they could not be queued, as every received event is.
+		waiting := e.unqueued
+		e.unqueued = nil
+		for _, env := range waiting {
+			e.handleEvent(env, true)
+		}
+	}()
 
 	for {
+		if len(e.unqueued) > 0 && retryC == nil {
+			interval := e.cfg.QueueRetryInterval
+			if interval <= 0 {
+				interval = DefaultQueueRetryInterval
+			}
+			retry = time.NewTimer(interval)
+			retryC = retry.C
+		}
 		select {
 		case env, ok := <-e.eventCh:
 			if !ok {
 				return
 			}
+			e.handleEvent(env, false)
 
-			// Route the event via the router (D-08).
-			var routedTo string
-			if e.cfg.Router != nil {
-				result := e.cfg.Router.Match(env.event.Sender)
-				if result != nil {
-					routedTo = result.Conductor
-				}
-			}
-
-			// Thread reply routing (D-07): if the event has a ParentDedupKey,
-			// look up the parent's session_id and route the reply to the same session.
-			var threadSessionID string
-			if env.event.ParentDedupKey != "" {
-				sid, lookupErr := e.cfg.DB.LookupWatcherEventSessionByDedupKey(env.watcherID, env.event.ParentDedupKey)
-				if lookupErr != nil {
-					e.log.Warn("thread_reply_lookup_failed",
-						slog.String("watcher_id", env.watcherID),
-						slog.String("parent_dedup_key", env.event.ParentDedupKey),
-						slog.String("error", lookupErr.Error()),
-					)
-				}
-				if sid != "" {
-					threadSessionID = sid
-					e.log.Debug("thread_reply_routed",
-						slog.String("watcher_id", env.watcherID),
-						slog.String("parent_dedup_key", env.event.ParentDedupKey),
-						slog.String("session_id", sid),
-					)
-				}
-				// D-08: if sid is empty, fall through to normal routing (routedTo from Router.Match)
-			}
-
-			// Unrouted branch: if event has no router match and no thread parent,
-			// it goes to triage. Mark routedTo = "triage" for persistence (D-05, T-18-12).
-			isTriage := routedTo == "" && env.event.ParentDedupKey == "" && e.triageReqCh != nil
-
-			if isTriage {
-				routedTo = "triage"
-			}
-
-			if e.cfg.Outbox != nil && routedTo != "" && !isTriage {
-				e.queueDelivery(env, routedTo)
-			}
-
-			// Persist with dedup via INSERT OR IGNORE (D-10, D-23).
-			inserted, err := e.cfg.DB.SaveWatcherEvent(
-				env.watcherID,
-				env.event.DedupKey(),
-				env.event.Sender,
-				env.event.Subject,
-				routedTo,
-				"", // sessionID: populated later when session is launched
-				env.event.Body,
-				e.cfg.MaxEventsPerWatcher,
-			)
-
-			if err != nil {
-				e.log.Error("save_event_failed",
-					slog.String("watcher_id", env.watcherID),
-					slog.String("sender", env.event.Sender),
-					slog.String("error", err.Error()),
-				)
-				env.tracker.RecordError()
-				continue
-			}
-
-			if inserted {
-				// New event: update health tracker and forward to TUI (D-14).
-				env.tracker.RecordEvent()
-
-				// Slice 4 (CORE-PLAN): additive tap onto the event bus.
-				e.bus.Publish("watcher.event", env.watcherID, map[string]any{
-					"sender":    env.event.Sender,
-					"subject":   env.event.Subject,
-					"routed_to": routedTo,
-					"dedup_key": env.event.DedupKey(),
-					"is_triage": isTriage,
-				})
-
-				// Persist per-watcher event log + state snapshot. Failures MUST NOT drop the event — log and continue.
-				// Snapshot current health via the existing public Check() method. Check() returns a
-				// read-locked HealthState copy: we pull ConsecutiveErrors directly and derive
-				// AdapterHealthy from Status != HealthStatusError (the classifier sets Status=Error
-				// when !adapterHealthy OR consecutiveErrors >= 10; since we record ConsecutiveErrors
-				// separately, Status==Error here uniquely implies adapterHealthy==false for the
-				// purposes of the persisted snapshot's AdapterHealthy bool).
-				hs := env.tracker.Check()
-				watcherName := hs.WatcherName
-				summary := env.event.Subject
-				if len(summary) > 400 {
-					summary = summary[:400]
-				}
-				logEntry := fmt.Sprintf("## %s - %s: %s",
-					e.clock.Now().UTC().Format(time.RFC3339),
-					env.event.Sender,
-					summary)
-				if err := AppendEventLog(watcherName, logEntry); err != nil {
-					e.log.Warn("event_log_append_failed",
-						slog.String("watcher", watcherName),
-						slog.String("error", err.Error()))
-				}
-				snapshot := &WatcherState{
-					LastEventTS:    e.clock.Now().UTC(),
-					ErrorCount:     hs.ConsecutiveErrors,
-					AdapterHealthy: hs.Status != HealthStatusError,
-				}
-				if env.event.Cursor != "" {
-					snapshot.DedupCursor = env.event.Cursor
-					snapshot.DedupCursorTime = env.event.Timestamp.UTC()
-				} else if prev, err := LoadState(watcherName); err == nil && prev != nil {
-					snapshot.DedupCursor = prev.DedupCursor
-					snapshot.DedupCursorTime = prev.DedupCursorTime
-				}
-				if err := SaveState(watcherName, snapshot); err != nil {
-					e.log.Warn("state_save_failed",
-						slog.String("watcher", watcherName),
-						slog.String("error", err.Error()))
-				}
-
-				// Set thread session ID for downstream routing (D-07).
-				if threadSessionID != "" {
-					env.event.ThreadSessionID = threadSessionID
-				}
-
-				// If this event is headed to triage, push to triageReqCh (D-05).
-				if isTriage {
-					triageSubDir := filepath.Join(e.cfg.TriageDir, env.event.DedupKey())
-					req := TriageRequest{
-						Event:      env.event,
-						WatcherID:  env.watcherID,
-						Profile:    e.cfg.Profile,
-						Tracker:    env.tracker,
-						TriageDir:  triageSubDir,
-						ResultPath: filepath.Join(triageSubDir, "result.json"),
-						SpawnedAt:  e.clock.Now(),
-					}
-					select {
-					case e.triageReqCh <- req:
-					default:
-						// triageReqCh full: update routed_to to triage-req-dropped (T-18-12).
-						if dbErr := e.cfg.DB.UpdateWatcherEventRoutedTo(
-							env.watcherID, env.event.DedupKey(), "triage-req-dropped", "",
-						); dbErr != nil {
-							e.log.Warn("triage_req_dropped_update_failed",
-								slog.String("watcher_id", env.watcherID),
-								slog.String("error", dbErr.Error()),
-							)
-						}
-						e.log.Warn("triage_req_channel_full",
-							slog.String("sender", env.event.Sender),
-						)
-					}
-				}
-
-				// Non-blocking send to routedEventCh for TUI consumption.
-				env.event.RoutedTo = routedTo
-				select {
-				case e.routedEventCh <- env.event:
-				default:
-					e.log.Debug("routed_event_channel_full",
-						slog.String("sender", env.event.Sender),
-					)
-				}
-			} else if env.event.Cursor != "" {
-				// A duplicate (typically a message replayed after a restart)
-				// was already stored: only move the resume position past it.
-				e.advanceResumeCursor(env)
+		case <-retryC:
+			retryC = nil
+			waiting := e.unqueued
+			e.unqueued = nil
+			for _, env := range waiting {
+				e.handleEvent(env, false)
 			}
 
 		case <-e.ctx.Done():
@@ -563,13 +446,207 @@ func (e *Engine) writerLoop() {
 	}
 }
 
+// handleEvent routes, queues and stores one event (writerLoop). With last
+// set, an event the outbox cannot queue is stored anyway instead of waiting
+// for another try.
+func (e *Engine) handleEvent(env eventEnvelope, last bool) {
+	// Route the event via the router (D-08).
+	var routedTo string
+	if e.cfg.Router != nil {
+		result := e.cfg.Router.Match(env.event.Sender)
+		if result != nil {
+			routedTo = result.Conductor
+		}
+	}
+
+	// Thread reply routing (D-07): if the event has a ParentDedupKey,
+	// look up the parent's session_id and route the reply to the same session.
+	var threadSessionID string
+	if env.event.ParentDedupKey != "" {
+		sid, lookupErr := e.cfg.DB.LookupWatcherEventSessionByDedupKey(env.watcherID, env.event.ParentDedupKey)
+		if lookupErr != nil {
+			e.log.Warn("thread_reply_lookup_failed",
+				slog.String("watcher_id", env.watcherID),
+				slog.String("parent_dedup_key", env.event.ParentDedupKey),
+				slog.String("error", lookupErr.Error()),
+			)
+		}
+		if sid != "" {
+			threadSessionID = sid
+			e.log.Debug("thread_reply_routed",
+				slog.String("watcher_id", env.watcherID),
+				slog.String("parent_dedup_key", env.event.ParentDedupKey),
+				slog.String("session_id", sid),
+			)
+		}
+		// D-08: if sid is empty, fall through to normal routing (routedTo from Router.Match)
+	}
+
+	// Unrouted branch: if event has no router match and no thread parent,
+	// it goes to triage. Mark routedTo = "triage" for persistence (D-05, T-18-12).
+	isTriage := routedTo == "" && env.event.ParentDedupKey == "" && e.triageReqCh != nil
+
+	if isTriage {
+		routedTo = "triage"
+	}
+
+	if e.cfg.Outbox != nil && routedTo != "" && !isTriage && e.queueDelivery(&env, routedTo, last) {
+		// The outbox failed in a way a retry can fix (reading the
+		// sessions, writing the queue). The event stays unstored:
+		// a stored event is never queued again, so storing it now
+		// would lose its delivery for good.
+		e.holdUnqueued(env)
+		return
+	}
+
+	// Persist with dedup via INSERT OR IGNORE (D-10, D-23).
+	inserted, err := e.cfg.DB.SaveWatcherEvent(
+		env.watcherID,
+		env.event.DedupKey(),
+		env.event.Sender,
+		env.event.Subject,
+		routedTo,
+		"", // sessionID: populated later when session is launched
+		env.event.Body,
+		e.cfg.MaxEventsPerWatcher,
+	)
+
+	if err != nil {
+		e.log.Error("save_event_failed",
+			slog.String("watcher_id", env.watcherID),
+			slog.String("sender", env.event.Sender),
+			slog.String("error", err.Error()),
+		)
+		env.tracker.RecordError()
+		return
+	}
+
+	if inserted {
+		// New event: update health tracker and forward to TUI (D-14).
+		env.tracker.RecordEvent()
+
+		// Slice 4 (CORE-PLAN): additive tap onto the event bus.
+		e.bus.Publish("watcher.event", env.watcherID, map[string]any{
+			"sender":    env.event.Sender,
+			"subject":   env.event.Subject,
+			"routed_to": routedTo,
+			"dedup_key": env.event.DedupKey(),
+			"is_triage": isTriage,
+		})
+
+		// Persist per-watcher event log + state snapshot. Failures MUST NOT drop the event — log and continue.
+		// Snapshot current health via the existing public Check() method. Check() returns a
+		// read-locked HealthState copy: we pull ConsecutiveErrors directly and derive
+		// AdapterHealthy from Status != HealthStatusError (the classifier sets Status=Error
+		// when !adapterHealthy OR consecutiveErrors >= 10; since we record ConsecutiveErrors
+		// separately, Status==Error here uniquely implies adapterHealthy==false for the
+		// purposes of the persisted snapshot's AdapterHealthy bool).
+		hs := env.tracker.Check()
+		watcherName := hs.WatcherName
+		summary := env.event.Subject
+		if len(summary) > 400 {
+			summary = summary[:400]
+		}
+		logEntry := fmt.Sprintf("## %s - %s: %s",
+			e.clock.Now().UTC().Format(time.RFC3339),
+			env.event.Sender,
+			summary)
+		if err := AppendEventLog(watcherName, logEntry); err != nil {
+			e.log.Warn("event_log_append_failed",
+				slog.String("watcher", watcherName),
+				slog.String("error", err.Error()))
+		}
+		snapshot := &WatcherState{
+			LastEventTS:    e.clock.Now().UTC(),
+			ErrorCount:     hs.ConsecutiveErrors,
+			AdapterHealthy: hs.Status != HealthStatusError,
+		}
+		if env.event.Cursor != "" {
+			snapshot.DedupCursor = env.event.Cursor
+			snapshot.DedupCursorTime = env.event.Timestamp.UTC()
+		} else if prev, err := LoadState(watcherName); err == nil && prev != nil {
+			snapshot.DedupCursor = prev.DedupCursor
+			snapshot.DedupCursorTime = prev.DedupCursorTime
+		}
+		if err := SaveState(watcherName, snapshot); err != nil {
+			e.log.Warn("state_save_failed",
+				slog.String("watcher", watcherName),
+				slog.String("error", err.Error()))
+		}
+
+		// Set thread session ID for downstream routing (D-07).
+		if threadSessionID != "" {
+			env.event.ThreadSessionID = threadSessionID
+		}
+
+		// If this event is headed to triage, push to triageReqCh (D-05).
+		if isTriage {
+			triageSubDir := filepath.Join(e.cfg.TriageDir, env.event.DedupKey())
+			req := TriageRequest{
+				Event:      env.event,
+				WatcherID:  env.watcherID,
+				Profile:    e.cfg.Profile,
+				Tracker:    env.tracker,
+				TriageDir:  triageSubDir,
+				ResultPath: filepath.Join(triageSubDir, "result.json"),
+				SpawnedAt:  e.clock.Now(),
+			}
+			select {
+			case e.triageReqCh <- req:
+			default:
+				// triageReqCh full: update routed_to to triage-req-dropped (T-18-12).
+				if dbErr := e.cfg.DB.UpdateWatcherEventRoutedTo(
+					env.watcherID, env.event.DedupKey(), "triage-req-dropped", "",
+				); dbErr != nil {
+					e.log.Warn("triage_req_dropped_update_failed",
+						slog.String("watcher_id", env.watcherID),
+						slog.String("error", dbErr.Error()),
+					)
+				}
+				e.log.Warn("triage_req_channel_full",
+					slog.String("sender", env.event.Sender),
+				)
+			}
+		}
+
+		// Non-blocking send to routedEventCh for TUI consumption.
+		env.event.RoutedTo = routedTo
+		select {
+		case e.routedEventCh <- env.event:
+		default:
+			e.log.Debug("routed_event_channel_full",
+				slog.String("sender", env.event.Sender),
+			)
+		}
+	} else if env.event.Cursor != "" {
+		// A duplicate (typically a message replayed after a restart)
+		// was already stored: only move the resume position past it.
+		e.advanceResumeCursor(env)
+	}
+}
+
+// holdUnqueued keeps env for the writer's next queue retry. Past
+// maxUnqueued waiting events it gets its last try at once.
+func (e *Engine) holdUnqueued(env eventEnvelope) {
+	if len(e.unqueued) >= maxUnqueued {
+		e.handleEvent(env, true)
+		return
+	}
+	e.unqueued = append(e.unqueued, env)
+}
+
 // queueDelivery hands a new event routed to a conductor to the outbox
 // (#2537). It runs before the event is stored, so a crash in between cannot
 // leave a stored event that nothing delivers: a stored event is never routed
 // again. An event already stored is a replay, which the conductor got the
 // first time, and is not queued; the queue's key keeps an event stored again
 // after its row was pruned from being queued twice.
-func (e *Engine) queueDelivery(env eventEnvelope, conductor string) {
+//
+// It reports whether the caller should keep the event unstored and try
+// again: the outbox failed for a reason other than the conductor having no
+// session, and this is not the last try. A conductor with no session cannot
+// be queued for until one is created, so that event is stored as before.
+func (e *Engine) queueDelivery(env *eventEnvelope, conductor string, last bool) (retry bool) {
 	name := env.tracker.Check().WatcherName
 	stored, err := e.cfg.DB.HasWatcherEvent(env.watcherID, env.event.DedupKey())
 	if err != nil {
@@ -584,14 +661,37 @@ func (e *Engine) queueDelivery(env eventEnvelope, conductor string) {
 	}
 	evt := env.event
 	evt.RoutedTo = conductor
-	if err := e.cfg.Outbox.Enqueue(env.watcherID, name, evt); err != nil {
-		e.log.Warn("watcher_delivery_not_queued",
-			slog.String("watcher", name),
-			slog.String("conductor", conductor),
-			slog.String("sender", evt.Sender),
-			slog.String("error", err.Error()),
-		)
+	err = e.cfg.Outbox.Enqueue(env.watcherID, name, evt)
+	if err == nil {
+		if env.queueFailures > 0 {
+			e.log.Info("watcher_delivery_queued_after_retry",
+				slog.String("watcher", name),
+				slog.String("conductor", conductor),
+				slog.Int("failures", env.queueFailures),
+			)
+		}
+		return false
 	}
+	env.queueFailures++
+	if !last && !errors.Is(err, ErrNoConductorSession) {
+		if env.queueFailures == 1 {
+			e.log.Warn("watcher_delivery_queue_failed",
+				slog.String("watcher", name),
+				slog.String("conductor", conductor),
+				slog.String("sender", evt.Sender),
+				slog.String("error", err.Error()),
+			)
+		}
+		return true
+	}
+	e.log.Warn("watcher_delivery_not_queued",
+		slog.String("watcher", name),
+		slog.String("conductor", conductor),
+		slog.String("sender", evt.Sender),
+		slog.Int("failures", env.queueFailures),
+		slog.String("error", err.Error()),
+	)
+	return false
 }
 
 // DefaultResumeMaxAge bounds how far back a restarted ntfy or slack watcher

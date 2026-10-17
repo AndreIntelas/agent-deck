@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -29,6 +30,11 @@ type PendingDelivery struct {
 
 // deliveryKeyPrefix starts the send queue key of every routed event.
 const deliveryKeyPrefix = "watcher:"
+
+// ErrNoConductorSession is the Enqueue error for a conductor with no
+// session to address. Unlike a failure to read the sessions or write the
+// queue, retrying does not help until the conductor is created.
+var ErrNoConductorSession = errors.New("no conductor session")
 
 // DeliveryKey is the send queue key of evt from the watcher watcherID: the
 // same event routed again (a replay, or a re-insert after its row was
@@ -115,7 +121,7 @@ func (o *ConductorOutbox) Enqueue(watcherID, watcherName string, evt Event) erro
 		}
 	}
 	if target == nil {
-		return fmt.Errorf("conductor %q has no session titled %q that is not archived", evt.RoutedTo, title)
+		return fmt.Errorf("%w: conductor %q has no session titled %q that is not archived", ErrNoConductorSession, evt.RoutedTo, title)
 	}
 	now := time.Now()
 	s := sendqueue.Send{

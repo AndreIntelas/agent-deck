@@ -1,6 +1,8 @@
 package watcher
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -158,5 +160,119 @@ func TestIssue2537_HealthStateReportsUndeliveredEvents(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no health state")
+	}
+}
+
+// flakyOutbox fails Enqueue with err for its first failures calls, then
+// records like recordingOutbox; failures < 0 fails every call.
+type flakyOutbox struct {
+	recordingOutbox
+	err      error
+	failures int
+
+	callMu sync.Mutex
+	calls  int
+}
+
+func (o *flakyOutbox) Enqueue(watcherID, name string, evt Event) error {
+	o.callMu.Lock()
+	o.calls++
+	fail := o.failures < 0 || o.calls <= o.failures
+	o.callMu.Unlock()
+	if fail {
+		return o.err
+	}
+	return o.recordingOutbox.Enqueue(watcherID, name, evt)
+}
+
+func (o *flakyOutbox) callCount() int {
+	o.callMu.Lock()
+	defer o.callMu.Unlock()
+	return o.calls
+}
+
+// TestIssue2537_AnEventTheOutboxFailsToQueueIsQueuedOnRetry: the outbox
+// fails twice for a reason a retry can fix (here a locked database). The
+// event is not stored meanwhile, since a stored event is never queued again;
+// the writer retries, the event is queued once, unstored at that point, and
+// then stored.
+func TestIssue2537_AnEventTheOutboxFailsToQueueIsQueuedOnRetry(t *testing.T) {
+	db := newTestDB(t)
+	saveTestWatcher(t, db, "w1", "inbox", "mock")
+	outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: errors.New("database is locked"), failures: 2}
+	engine := newOutboxTestEngine(t, db, outbox, 0)
+	engine.cfg.QueueRetryInterval = 100 * time.Millisecond
+	evt := Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: "retried", Timestamp: time.Now()}
+	engine.RegisterAdapter("w1", &MockAdapter{events: []Event{evt}, listenDelay: 10 * time.Millisecond},
+		AdapterConfig{Type: "mock", Name: "inbox"}, 60)
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(engine.Stop)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for outbox.callCount() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the event never reached the outbox")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := countWatcherEvents(t, db, "w1"); n != 0 {
+		t.Fatalf("the event was stored after the outbox failed to queue it (%d rows)", n)
+	}
+	for {
+		if events, _ := outbox.got(); len(events) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the event was not queued after %d tries", outbox.callCount())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for countWatcherEvents(t, db, "w1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the event was not stored once it was queued")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	events, stored := outbox.got()
+	if len(events) != 1 || stored[0] || outbox.callCount() != 3 {
+		t.Fatalf("queued %d time(s) after %d tries, stored at that point %v; want once on the third try, unstored", len(events), outbox.callCount(), stored)
+	}
+}
+
+// TestIssue2537_AnEventTheOutboxCannotQueueIsStillStored: an event for a
+// conductor with no session is stored at once, without retries, since none
+// would help. An event the outbox keeps failing for another reason is
+// retried until the engine stops, and then stored, as every received event
+// is.
+func TestIssue2537_AnEventTheOutboxCannotQueueIsStillStored(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"no conductor session", fmt.Errorf("%w: conductor %q has no session", ErrNoConductorSession, "demo")},
+		{"outbox keeps failing", errors.New("database is locked")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db := newTestDB(t)
+			saveTestWatcher(t, db, "w1", "inbox", "mock")
+			outbox := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: c.err, failures: -1}
+			engine := newOutboxTestEngine(t, db, outbox, 0)
+			engine.cfg.QueueRetryInterval = 50 * time.Millisecond
+			runEvents(t, engine, Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: c.name, Timestamp: time.Now()})
+
+			if n := countWatcherEvents(t, db, "w1"); n != 1 {
+				t.Fatalf("watcher_events holds %d rows after the engine stopped, want the event", n)
+			}
+			calls := outbox.callCount()
+			if errors.Is(c.err, ErrNoConductorSession) && calls != 1 {
+				t.Fatalf("the outbox was tried %d times for a conductor with no session, want once", calls)
+			}
+			if !errors.Is(c.err, ErrNoConductorSession) && calls < 3 {
+				t.Fatalf("the outbox was tried %d times, want retries and a last try at stop", calls)
+			}
+		})
 	}
 }
