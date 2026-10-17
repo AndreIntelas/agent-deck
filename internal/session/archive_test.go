@@ -75,6 +75,26 @@ func TestArchiveState_ReadsAndWritesUnderTheInstanceLock(t *testing.T) {
 	}
 }
 
+// TestIsArchived_DoesNotWaitOnTheStatusLock: UpdateStatus holds the
+// instance's mu across tool detection and metadata I/O, and the TUI checks
+// the archive state of every row it renders. Reading it must not wait for
+// that lock (#1753).
+func TestIsArchived_DoesNotWaitOnTheStatusLock(t *testing.T) {
+	inst := &Instance{ID: "s1", Title: "s1", ArchivedAt: time.Now().UTC()}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	read := make(chan bool, 1)
+	go func() { read <- inst.IsArchived() && !inst.ArchivedAtThreadSafe().IsZero() }()
+	select {
+	case archived := <-read:
+		if !archived {
+			t.Fatal("IsArchived = false for an archived session")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("IsArchived waited on the lock UpdateStatus holds")
+	}
+}
+
 func ids(insts []*Instance) []string {
 	out := make([]string, 0, len(insts))
 	for _, i := range insts {

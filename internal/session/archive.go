@@ -3,32 +3,33 @@ package session
 import "time"
 
 // IsArchived reports whether the session is in the user archive. It reads
-// ArchivedAt under the instance lock: the TUI renders, filters and looks up
-// conductors on other goroutines than the background commands that archive,
-// unarchive, restart from the archive or switch harness, which write it
-// through SetArchivedAtThreadSafe.
+// ArchivedAt under the instance's archive lock: the TUI renders, filters and
+// looks up conductors on other goroutines than the background commands that
+// archive, unarchive, restart from the archive or switch harness, which
+// write it through SetArchivedAtThreadSafe. That lock guards ArchivedAt
+// alone, so a render never waits on a status sweep holding mu.
 func (i *Instance) IsArchived() bool {
 	if i == nil {
 		return false
 	}
-	i.mu.RLock()
-	defer i.mu.RUnlock()
+	i.archiveMu.RLock()
+	defer i.archiveMu.RUnlock()
 	return !i.ArchivedAt.IsZero()
 }
 
-// ArchivedAtThreadSafe returns ArchivedAt, read under the instance lock.
+// ArchivedAtThreadSafe returns ArchivedAt, read under the archive lock.
 func (i *Instance) ArchivedAtThreadSafe() time.Time {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
+	i.archiveMu.RLock()
+	defer i.archiveMu.RUnlock()
 	return i.ArchivedAt
 }
 
-// SetArchivedAtThreadSafe sets ArchivedAt under the instance lock. The zero
+// SetArchivedAtThreadSafe sets ArchivedAt under the archive lock. The zero
 // time unarchives the session.
 func (i *Instance) SetArchivedAtThreadSafe(t time.Time) {
-	i.mu.Lock()
+	i.archiveMu.Lock()
 	i.ArchivedAt = t
-	i.mu.Unlock()
+	i.archiveMu.Unlock()
 }
 
 // FilterInstancesByArchive returns instances whose archive state matches archived.

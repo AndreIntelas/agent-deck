@@ -644,6 +644,11 @@ type Instance struct {
 	// UpdateStatus() acquires the write lock internally.
 	mu sync.RWMutex
 
+	// archiveMu guards ArchivedAt alone (IsArchived, SetArchivedAtThreadSafe).
+	// It is not mu: UpdateStatus holds mu across tool detection and metadata
+	// I/O, and the TUI checks the archive state of every row it renders.
+	archiveMu sync.RWMutex
+
 	// spawnGen supersedes stale fast-death watchers; spawnWatchers lets teardown
 	// and tests join them before restoring process-global filesystem environment.
 	spawnGen      atomic.Uint64
