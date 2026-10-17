@@ -460,3 +460,42 @@ func TestIssue2537_AnEventWhoseReplayPositionCannotBeWrittenIsStored(t *testing.
 		t.Fatalf("watcher_events holds %d rows, want the event stored when no replay position could be written", n)
 	}
 }
+
+// TestIssue2537_AnUnreadableStateKeepsTheEarlierReplayPosition: E1 left a
+// replay position; then the state cannot be read while E2 is held. The
+// engine must not start from an empty state and overwrite E1's earlier
+// position with E2's later one, or a crash before E1 is queued would resume
+// past it.
+func TestIssue2537_AnUnreadableStateKeepsTheEarlierReplayPosition(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a file whatever its mode")
+	}
+	db := newTestDB(t)
+	name := "inbox-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	engine := newOutboxTestEngine(t, db, &recordingOutbox{db: db}, 0)
+	tracker := NewHealthTracker(name, 60)
+	t1 := time.Now().Add(-time.Hour)
+	e1 := eventEnvelope{event: Event{Sender: "alice@example.com", Timestamp: t1}, watcherID: "w1", tracker: tracker}
+	e2 := eventEnvelope{event: Event{Sender: "alice@example.com", Timestamp: t1.Add(30 * time.Minute)}, watcherID: "w1", tracker: tracker}
+	if err := engine.keepReplayPosition(e1); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := WatcherDir(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "state.json")
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.keepReplayPosition(e2); err == nil {
+		t.Fatal("keepReplayPosition with an unreadable state reported no error")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadState(name)
+	if err != nil || st == nil || !st.ReplayFrom.Equal(t1.Add(-time.Second).UTC()) {
+		t.Fatalf("watcher state %+v (%v); want E1's replay position kept", st, err)
+	}
+}

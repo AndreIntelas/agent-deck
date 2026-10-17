@@ -748,7 +748,8 @@ func (e *Engine) replayPending(watcherID string) bool {
 // keepReplayPosition records in env's watcher state a replay position no
 // later than env, before env is left unstored: a restart then resumes from
 // there (resumeSince) even when the watcher has no cursor yet, or a later
-// stored event has moved its cursor past env. It returns the write error.
+// stored event has moved its cursor past env. It returns the read or write
+// error; a state that exists but cannot be read is never written over.
 func (e *Engine) keepReplayPosition(env eventEnvelope) error {
 	ts := env.event.Timestamp
 	if ts.IsZero() {
@@ -757,7 +758,16 @@ func (e *Engine) keepReplayPosition(env eventEnvelope) error {
 	from := ts.Add(-time.Second).UTC()
 	name := env.tracker.Check().WatcherName
 	st, err := LoadState(name)
-	if err != nil || st == nil {
+	if err != nil {
+		// A state that cannot be read now may hold an earlier replay
+		// position; writing over it could move the position past an event
+		// still unstored. The caller tries again.
+		e.log.Warn("watcher_state_unreadable",
+			slog.String("watcher", name),
+			slog.String("error", err.Error()))
+		return err
+	}
+	if st == nil {
 		st = &WatcherState{}
 	}
 	if !st.ReplayFrom.IsZero() && !st.ReplayFrom.After(from) {
