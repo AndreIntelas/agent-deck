@@ -377,6 +377,9 @@ func main() {
 
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
+	// #2683: scrub CLAUDE_JOB_DIR before anything can exec tmux, the same
+	// way TELEGRAM_* is scrubbed before a child launch.
+	scrubClaudeJobDirForCommand(args)
 	if len(args) > 0 && args[0] == "creds-refresh" {
 		printCredsRefreshRemoved()
 		return
@@ -550,7 +553,7 @@ func main() {
 			handleHarness(profile, args[1:])
 			return
 		case "limits":
-			handleLimits(args[1:])
+			handleLimits(profile, args[1:])
 			return
 		case "conductor":
 			handleConductor(profile, args[1:])
@@ -2173,6 +2176,15 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 		exitCLI(1)
 	}
 
+	// #2683: an archived record holding this id would silently win the
+	// duplicate-id guard and the new session would start fresh.
+	if *resumeSession != "" {
+		if msg, code := checkArchivedClaudeIDConflict(instances, nil, *resumeSession); msg != "" {
+			NewCLIOutput(*jsonOutput, false).Error(msg, code)
+			exitCLI(1)
+		}
+	}
+
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
 
 	// Seed groups declared in config.toml into the DB before resolving the
@@ -3067,7 +3079,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		StatusSource      string    `json:"status_source,omitempty"`
 		Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
 		ExitCode          *int      `json:"exit_code,omitempty"`
-		SubstateDetail    string    `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time)
+		SubstateDetail    string    `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time; usage-limit window, model-limit model, account-blocked reason)
 		TmuxSession       string    `json:"tmux_session,omitempty"`
 		Profile           string    `json:"profile"`
 		CreatedAt         time.Time `json:"created_at"`
@@ -3099,6 +3111,9 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		// background-work (issue #2473): kind, task, step/steps, elapsed,
 		// source. Omitted when nothing is in flight.
 		BackgroundWork *tmux.BackgroundWork `json:"background_work,omitempty"`
+
+		// IntendedSwitch: see core.SessionRow (omitted when none or expired).
+		IntendedSwitch *session.IntendedSwitchJSON `json:"intended_switch,omitempty"`
 	}
 	sessions := make([]sessionJSON, len(instances))
 	transcripts := session.ListedTranscriptPaths(instances)
@@ -3116,6 +3131,8 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		substate := ""
 		if !cached[inst] {
 			substate = string(inst.Substate())
+		} else {
+			substate = string(inst.HistoricalSubstate())
 		}
 		parentProjectPath := listParentProjectPath(inst, instances)
 		sj := sessionJSON{
@@ -3151,6 +3168,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 			TranscriptPath:    transcripts[inst],
 			ResolvedCodexHome: inst.ResolvedCodexHome(),
 			LastActivityAt:    inst.DisplayLastActivityTime().Format(time.RFC3339Nano),
+			IntendedSwitch:    inst.ActiveIntendedSwitchJSON(time.Now()),
 		}
 		if cached[inst] {
 			sj.StatusSource = "cached"
@@ -3787,9 +3805,16 @@ func handleStatus(profile string, args []string) {
 					path = "~" + path[len(home):]
 				}
 				suffix := ""
-				if lbl := SubstateLabel(inst.Substate()); lbl != "" {
+				sub := inst.Substate()
+				if lbl := SubstateLabel(sub); lbl != "" {
 					if work := inst.BackgroundWork(); work.InFlight() {
 						lbl += ": " + work.Summary() // issue #2473
+					} else if isLimitSubstate(sub) {
+						// Name what the session is waiting on ("usage limit: weekly
+						// limit · resets 12pm"), not just that it waits.
+						if detail := inst.SubstateDetail(); detail != "" {
+							lbl += ": " + detail
+						}
 					}
 					suffix = "  [" + lbl + "]"
 					if exitCode := inst.ExitCode(); exitCode != nil {
