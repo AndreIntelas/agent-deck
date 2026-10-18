@@ -499,3 +499,59 @@ func TestIssue2537_AnUnreadableStateKeepsTheEarlierReplayPosition(t *testing.T) 
 		t.Fatalf("watcher state %+v (%v); want E1's replay position kept", st, err)
 	}
 }
+
+// TestIssue2537_ARetryableFailureSurvivesARestartAndIsQueuedOnce: the
+// outbox keeps failing for a reason a retry can fix until the engine stops.
+// The event is left unstored with a replay position before it. A new
+// engine (the next owner, after a restart or a handoff) replays it through
+// the real send queue outbox: it is queued exactly once, even when the
+// replay delivers it twice and a third owner replays it again, and it is
+// stored once.
+func TestIssue2537_ARetryableFailureSurvivesARestartAndIsQueuedOnce(t *testing.T) {
+	db := newTestDB(t)
+	name := "inbox-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	saveTestWatcher(t, db, "w1", name, "mock")
+	conductorID := saveTestConductor(t, db, "demo")
+	evt := Event{Source: "mock", Sender: "alice@example.com", Subject: "hi", Body: "survives a restart", Timestamp: time.Now(), Cursor: "c1"}
+
+	run := func(outbox Outbox, events ...Event) {
+		t.Helper()
+		engine := newOutboxTestEngine(t, db, outbox, 0)
+		engine.cfg.QueueRetryInterval = 50 * time.Millisecond
+		engine.RegisterAdapter("w1", &MockAdapter{events: events, listenDelay: 10 * time.Millisecond},
+			AdapterConfig{Type: "mock", Name: name}, 60)
+		if err := engine.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		time.Sleep(time.Duration(len(events))*10*time.Millisecond + 300*time.Millisecond)
+		engine.Stop()
+	}
+
+	failing := &flakyOutbox{recordingOutbox: recordingOutbox{db: db}, err: errors.New("database is locked"), failures: -1}
+	run(failing, evt)
+	if n := countWatcherEvents(t, db, "w1"); n != 0 {
+		t.Fatalf("watcher_events holds %d rows after the outbox never took the event, want 0", n)
+	}
+	st, err := LoadState(name)
+	if err != nil || st == nil || st.ReplayFrom.IsZero() || st.ReplayFrom.After(evt.Timestamp) {
+		t.Fatalf("watcher state %+v (%v); want a replay position no later than the event", st, err)
+	}
+
+	outbox, dir, spawned := newTestOutbox(t, db, 0)
+	run(outbox, evt, evt)
+	run(outbox, evt)
+
+	recs, err := sendqueue.List(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].SessionID != conductorID || recs[0].Key != DeliveryKey("w1", evt) {
+		t.Fatalf("send queue records %+v; want one for %s under the event's key", recs, conductorID)
+	}
+	if n := spawned.count(conductorID); n != 1 {
+		t.Fatalf("worker started %d times, want once", n)
+	}
+	if n := countWatcherEvents(t, db, "w1"); n != 1 {
+		t.Fatalf("watcher_events holds %d rows, want the event stored once", n)
+	}
+}
